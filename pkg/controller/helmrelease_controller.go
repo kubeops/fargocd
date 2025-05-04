@@ -17,13 +17,15 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"text/template"
 	"time"
 
-	"kubeops.dev/fargocd/pkg/featuresets"
-
+	"github.com/Masterminds/sprig/v3"
 	argov1a1 "github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/gitops-engine/pkg/health"
 	fluxhelmv2 "github.com/fluxcd/helm-controller/api/v2"
@@ -31,20 +33,18 @@ import (
 	fluxsrcv1 "github.com/fluxcd/source-controller/api/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/client-go/tools/cache"
-	uiapi "kmodules.xyz/resource-metadata/apis/ui/v1alpha1"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/source"
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -53,9 +53,18 @@ const (
 	helmReleaseAnnotation       = "fargocd.appscode.com/helmrelease"
 )
 
+var buffers = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
 type HelmReleaseReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme            *runtime.Scheme
+	ArgoClient        client.Client
+	DestinationServer string
+	ClusterName       string
 }
 
 func (r *HelmReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -115,13 +124,12 @@ func (r *HelmReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// Create or update corresponding ArgoCD Application
 	app := &argov1a1.Application{
 		ObjectMeta: metav1.ObjectMeta{
-			// Name:      fmt.Sprintf("%s-%s", hr.Name, hr.Namespace),
-			Name:      appName(hr.Name),
+			Name:      r.appName(hr.Name),
 			Namespace: argoNamespace,
 		},
 	}
 
-	op, err := controllerutil.CreateOrPatch(ctx, r.Client, app, func() error {
+	op, err := controllerutil.CreateOrPatch(ctx, r.ArgoClient, app, func() error {
 		return r.syncApplication(ctx, app, &hr)
 	})
 	if err != nil {
@@ -141,7 +149,7 @@ func (r *HelmReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 func (r *HelmReleaseReconciler) getArgoCDNamespace(ctx context.Context) (string, error) {
 	var serviceList corev1.ServiceList
-	if err := r.List(ctx, &serviceList, client.MatchingLabels{"app.kubernetes.io/name": "argocd-server"}); err != nil {
+	if err := r.ArgoClient.List(ctx, &serviceList, client.MatchingLabels{"app.kubernetes.io/name": "argocd-server"}); err != nil {
 		return "", err
 	}
 
@@ -153,12 +161,14 @@ func (r *HelmReleaseReconciler) getArgoCDNamespace(ctx context.Context) (string,
 	return serviceList.Items[0].Namespace, nil
 }
 
-func appName(hrName string) string {
+func (r *HelmReleaseReconciler) appName(hrName string) string {
+	if hrName == "ace" {
+		return hrName
+	}
+	if r.ClusterName != "" {
+		return fmt.Sprintf("%s-%s", hrName, r.ClusterName)
+	}
 	return hrName
-	//if hrName == "ace" {
-	//	return hrName
-	//}
-	//return fmt.Sprintf("%s-ace", hrName)
 }
 
 func (r *HelmReleaseReconciler) checkDependenciesHealth(ctx context.Context, hr *fluxhelmv2.HelmRelease, argoNamespace string) (bool, string) {
@@ -173,10 +183,10 @@ func (r *HelmReleaseReconciler) checkDependenciesHealth(ctx context.Context, hr 
 		//}
 		//depAppName := fmt.Sprintf("%s-%s", dep.Name, depNamespace)
 
-		depAppName := appName(dep.Name)
+		depAppName := r.appName(dep.Name)
 		var depApp argov1a1.Application
 
-		if err := r.Get(ctx, types.NamespacedName{
+		if err := r.ArgoClient.Get(ctx, types.NamespacedName{
 			Name:      depAppName,
 			Namespace: argoNamespace,
 		}, &depApp); err != nil {
@@ -243,7 +253,7 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 			},
 		},
 		Destination: argov1a1.ApplicationDestination{
-			Server:    "https://kubernetes.default.svc",
+			Server:    r.DestinationServer,
 			Namespace: hr.GetReleaseNamespace(),
 		},
 		SyncPolicy: &argov1a1.SyncPolicy{
@@ -258,31 +268,35 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 	}
 	// Copy ignoreDifferences from annotation
 	if ignoreDiffs, ok := hr.Annotations[ignoreDifferencesAnnotation]; ok && ignoreDiffs != "" {
+		vals := map[string]interface{}{
+			"Chart": map[string]interface{}{
+				"Name":    hr.Spec.Chart.Spec.Chart,
+				"Version": hr.Spec.Chart.Spec.Version,
+			},
+			// "Capabilities": caps,
+			"Release": map[string]interface{}{
+				"Name":      app.Name,
+				"Namespace": hr.GetReleaseNamespace(),
+				"Service":   "Helm",
+			},
+		}
+
+		tpl := template.Must(template.New("argo").Funcs(sprig.TxtFuncMap()).Parse(ignoreDiffs))
+		buf := buffers.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer buffers.Put(buf)
+		err = tpl.Execute(buf, vals)
+		if err != nil {
+			log.Error(err, "failed to render ignore-differences annotation")
+			return err
+		}
+
 		var ignoreDifferences []argov1a1.ResourceIgnoreDifferences
-		if err := json.Unmarshal([]byte(ignoreDiffs), &ignoreDifferences); err != nil {
+		if err := yaml.Unmarshal(buf.Bytes(), &ignoreDifferences); err != nil {
 			log.Error(err, "failed to parse ignore-differences annotation")
 			return err
 		}
 		app.Spec.IgnoreDifferences = ignoreDifferences
-	} else {
-		var feature uiapi.Feature
-		var filename string
-		if err := r.Get(ctx, client.ObjectKey{Name: hr.Name}, &feature); err != nil {
-			if apierrors.IsNotFound(err) && hr.Name == "ace" {
-				filename = hr.Name + ".yaml"
-			} else {
-				return client.IgnoreNotFound(err)
-			}
-		} else {
-			filename = fmt.Sprintf("%s/%s.yaml", feature.Spec.FeatureSet, feature.Name)
-		}
-
-		if ignoreDifferences, err := featuresets.IgnoreDifferences(filename); err != nil {
-			log.Error(err, "failed to parse ignore-differences from file "+filename)
-			return err
-		} else {
-			app.Spec.IgnoreDifferences = ignoreDifferences
-		}
 	}
 
 	// Update HelmRelease status based on Application status
@@ -381,16 +395,17 @@ func (r *HelmReleaseReconciler) cleanupApplication(ctx context.Context, hr *flux
 		},
 	}
 
-	if err := r.Delete(ctx, app); err != nil && !errors.IsNotFound(err) {
+	if err := r.ArgoClient.Delete(ctx, app); err != nil && !errors.IsNotFound(err) {
 		return err
 	}
 	return nil
 }
 
-func (r *HelmReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *HelmReleaseReconciler) SetupWithManager(mgr, argoMgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&fluxhelmv2.HelmRelease{}).
-		Watches(
+		WatchesRawSource(source.Kind[client.Object](
+			argoMgr.GetCache(),
 			&argov1a1.Application{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []ctrl.Request {
 				ns, name, err := cache.SplitMetaNamespaceKey(o.GetAnnotations()[helmReleaseAnnotation])
@@ -406,7 +421,7 @@ func (r *HelmReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					},
 				}
 			}),
-		).
+		)).
 		Watches(
 			&fluxsrcv1.HelmRepository{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []ctrl.Request {
@@ -432,7 +447,8 @@ func (r *HelmReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return nil
 			}),
 		).
-		Watches(
+		WatchesRawSource(source.Kind[client.Object](
+			argoMgr.GetCache(),
 			&corev1.Service{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []ctrl.Request {
 				obj := o.(*corev1.Service)
@@ -455,7 +471,7 @@ func (r *HelmReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}
 				return nil
 			}),
-			builder.WithPredicates(predicate.LabelChangedPredicate{}),
-		).
+			predicate.LabelChangedPredicate{},
+		)).
 		Complete(r)
 }

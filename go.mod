@@ -5,6 +5,7 @@ go 1.23.5
 toolchain go1.24.1
 
 require (
+	github.com/Masterminds/sprig/v3 v3.3.0
 	github.com/argoproj/argo-cd/v2 v2.14.5
 	github.com/argoproj/gitops-engine v0.7.1-0.20250420064138-d65e9d92277d
 	github.com/fluxcd/helm-controller/api v1.2.0
@@ -31,7 +32,6 @@ require (
 	github.com/MakeNowJust/heredoc v1.0.0 // indirect
 	github.com/Masterminds/goutils v1.1.1 // indirect
 	github.com/Masterminds/semver/v3 v3.3.1 // indirect
-	github.com/Masterminds/sprig/v3 v3.3.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/ProtonMail/go-crypto v1.1.5 // indirect
 	github.com/PuerkitoBio/purell v1.2.1 // indirect

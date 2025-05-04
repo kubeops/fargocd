@@ -17,6 +17,7 @@ limitations under the License.
 package cmds
 
 import (
+	"context"
 	"crypto/tls"
 	"os"
 	"path/filepath"
@@ -32,11 +33,13 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	uiapi "kmodules.xyz/resource-metadata/apis/ui/v1alpha1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -63,6 +66,9 @@ func NewCmdRun() *cobra.Command {
 	secureMetrics := true
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
+	var argoKubeconfig string
+	argoDestinationServer := "https://kubernetes.default.svc"
+	var clusterName string
 	cmd := &cobra.Command{
 		Use:               "run",
 		Short:             "Launch FluxCD to ArgoCD bridge",
@@ -153,10 +159,42 @@ func NewCmdRun() *cobra.Command {
 				os.Exit(1)
 			}
 
+			var argoManager ctrl.Manager
+			if argoKubeconfig != "" {
+				argoConfig, err := clientcmd.BuildConfigFromFlags("", argoKubeconfig)
+				if err != nil {
+					setupLog.Error(err, "unable to build multicluster rest config")
+					os.Exit(1)
+				}
+				argoManager, err = ctrl.NewManager(argoConfig, ctrl.Options{
+					Scheme:                 scheme,
+					Metrics:                metricsserver.Options{BindAddress: "0"},
+					HealthProbeBindAddress: "0",
+					LeaderElection:         enableLeaderElection,
+					LeaderElectionID:       "03b9a432.fargocd.appscode.com",
+				})
+				if err != nil {
+					setupLog.Error(err, "unable to create mc manager")
+					os.Exit(1)
+				}
+
+				if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+					return argoManager.Start(ctx)
+				})); err != nil {
+					setupLog.Error(err, "problem running argo server manager")
+					os.Exit(1)
+				}
+			} else {
+				argoManager = mgr
+			}
+
 			if err = (&controller.HelmReleaseReconciler{
-				Client: mgr.GetClient(),
-				Scheme: mgr.GetScheme(),
-			}).SetupWithManager(mgr); err != nil {
+				Client:            mgr.GetClient(),
+				Scheme:            mgr.GetScheme(),
+				ArgoClient:        argoManager.GetClient(),
+				DestinationServer: argoDestinationServer,
+				ClusterName:       clusterName,
+			}).SetupWithManager(mgr, argoManager); err != nil {
 				setupLog.Error(err, "unable to create controller", "controller", "HelmRelease")
 				os.Exit(1)
 			}
@@ -199,6 +237,11 @@ func NewCmdRun() *cobra.Command {
 		"The directory that contains the webhook and metrics server certificate.")
 	cmd.Flags().BoolVar(&enableHTTP2, "enable-http2", enableHTTP2,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-
+	cmd.Flags().StringVar(&argoKubeconfig, "argo-kubeconfig", argoKubeconfig,
+		"The path to argo server kubeconfig")
+	cmd.Flags().StringVar(&argoDestinationServer, "argo-dest-server", argoDestinationServer,
+		"Destination server for argo server")
+	cmd.Flags().StringVar(&clusterName, "cluster-name", clusterName,
+		"Spoke cluster name")
 	return cmd
 }
