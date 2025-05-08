@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"github.com/Masterminds/sprig/v3"
-	argov1a1 "github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
+	argov1a1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/gitops-engine/pkg/health"
 	fluxhelmv2 "github.com/fluxcd/helm-controller/api/v2"
 	"github.com/fluxcd/pkg/chartutil"

@@ -24,7 +24,7 @@ import (
 
 	"kubeops.dev/fargocd/pkg/controller"
 
-	argov1a1 "github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
+	argov1a1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	fluxhelmv2 "github.com/fluxcd/helm-controller/api/v2"
 	fluxsrcv1 "github.com/fluxcd/source-controller/api/v1"
 	"github.com/spf13/cobra"
