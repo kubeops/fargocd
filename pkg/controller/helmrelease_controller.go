@@ -54,7 +54,7 @@ const (
 )
 
 var buffers = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(bytes.Buffer)
 	},
 }
@@ -81,7 +81,7 @@ func (r *HelmReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// Check if HelmRelease is being deleted
-	if hr.ObjectMeta.DeletionTimestamp != nil {
+	if hr.DeletionTimestamp != nil {
 		if controllerutil.ContainsFinalizer(&hr, finalizerName) {
 			// Cleanup the Application
 			if err := r.cleanupApplication(ctx, &hr); err != nil {
@@ -215,8 +215,8 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 	}
 
 	// Ensure annotations map exists
-	if app.ObjectMeta.Annotations == nil {
-		app.ObjectMeta.Annotations = make(map[string]string)
+	if app.Annotations == nil {
+		app.Annotations = make(map[string]string)
 	}
 
 	// Store HelmRelease namespace and name in annotation
@@ -224,7 +224,7 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 	if err != nil {
 		return err
 	}
-	app.ObjectMeta.Annotations[helmReleaseAnnotation] = helmReleaseRef
+	app.Annotations[helmReleaseAnnotation] = helmReleaseRef
 
 	// Compose values based from the spec and references.
 	values, err := chartutil.ChartValuesFromReferences(ctx,
@@ -268,13 +268,13 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 	}
 	// Copy ignoreDifferences from annotation
 	if ignoreDiffs, ok := hr.Annotations[ignoreDifferencesAnnotation]; ok && ignoreDiffs != "" {
-		vals := map[string]interface{}{
-			"Chart": map[string]interface{}{
+		vals := map[string]any{
+			"Chart": map[string]any{
 				"Name":    hr.Spec.Chart.Spec.Chart,
 				"Version": hr.Spec.Chart.Spec.Version,
 			},
 			// "Capabilities": caps,
-			"Release": map[string]interface{}{
+			"Release": map[string]any{
 				"Name":      app.Name,
 				"Namespace": hr.GetReleaseNamespace(),
 				"Service":   "Helm",
