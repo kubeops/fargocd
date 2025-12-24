@@ -1,13 +1,11 @@
 module kubeops.dev/fargocd
 
-go 1.24.4
-
-toolchain go1.24.5
+go 1.24.6
 
 require (
 	github.com/Masterminds/sprig/v3 v3.3.0
-	github.com/argoproj/argo-cd/v3 v3.0.11
-	github.com/argoproj/gitops-engine v0.7.1-0.20250520182409-89c110b5952e
+	github.com/argoproj/argo-cd/v3 v3.0.19
+	github.com/argoproj/gitops-engine v0.7.1-0.20250905153922-d96c3d51e4c4
 	github.com/fluxcd/helm-controller/api v1.2.0
 	github.com/fluxcd/pkg/chartutil v1.1.0
 	github.com/fluxcd/source-controller/api v1.5.0
