@@ -17,15 +17,13 @@ limitations under the License.
 package controller
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"strings"
-	"sync"
-	"text/template"
 	"time"
 
-	"github.com/Masterminds/sprig/v3"
+	"kubeops.dev/fargocd/pkg/ignoregen"
+
 	argov1a1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/gitops-engine/pkg/health"
 	fluxhelmv2 "github.com/fluxcd/helm-controller/api/v2"
@@ -44,20 +42,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/source"
-	"sigs.k8s.io/yaml"
 )
 
 const (
-	finalizerName               = "helmrelease.finalizers.example.com"
-	ignoreDifferencesAnnotation = "fargocd.appscode.com/ignore-differences"
-	helmReleaseAnnotation       = "fargocd.appscode.com/helmrelease"
+	finalizerName         = "helmrelease.finalizers.example.com"
+	helmReleaseAnnotation = "fargocd.appscode.com/helmrelease"
 )
-
-var buffers = sync.Pool{
-	New: func() any {
-		return new(bytes.Buffer)
-	},
-}
 
 type HelmReleaseReconciler struct {
 	client.Client
@@ -209,7 +199,7 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 	log := log.FromContext(ctx)
 
 	// Get the HelmRepository
-	repoURL, err := r.getHelmRepositoryURL(ctx, hr)
+	repoURL, helmRepo, err := r.getHelmRepository(ctx, hr)
 	if err != nil {
 		return err
 	}
@@ -257,46 +247,30 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 			Namespace: hr.GetReleaseNamespace(),
 		},
 		SyncPolicy: &argov1a1.SyncPolicy{
-			Automated: &argov1a1.SyncPolicyAutomated{
-				// Prune:    true,
-				// SelfHeal: true,
-			},
+			Automated: &argov1a1.SyncPolicyAutomated{},
 			SyncOptions: argov1a1.SyncOptions{
 				"CreateNamespace=true",
 			},
 		},
 	}
-	// Copy ignoreDifferences from annotation
-	if ignoreDiffs, ok := hr.Annotations[ignoreDifferencesAnnotation]; ok && ignoreDiffs != "" {
-		vals := map[string]any{
-			"Chart": map[string]any{
-				"Name":    hr.Spec.Chart.Spec.Chart,
-				"Version": hr.Spec.Chart.Spec.Version,
-			},
-			// "Capabilities": caps,
-			"Release": map[string]any{
-				"Name":      app.Name,
-				"Namespace": hr.GetReleaseNamespace(),
-				"Service":   "Helm",
-			},
-		}
 
-		tpl := template.Must(template.New("argo").Funcs(sprig.TxtFuncMap()).Parse(ignoreDiffs))
-		buf := buffers.Get().(*bytes.Buffer)
-		buf.Reset()
-		defer buffers.Put(buf)
-		err = tpl.Execute(buf, vals)
-		if err != nil {
-			log.Error(err, "failed to render ignore-differences annotation")
-			return err
-		}
+	// Auto-detect ignoreDifferences by rendering the chart twice
+	chartName := hr.Spec.Chart.Spec.Chart
+	chartVersion := hr.Spec.Chart.Spec.Version
+	chartRepoURL := strings.TrimPrefix(repoURL, "oci://")
+	namespace := hr.GetReleaseNamespace()
 
-		var ignoreDifferences []argov1a1.ResourceIgnoreDifferences
-		if err := yaml.Unmarshal(buf.Bytes(), &ignoreDifferences); err != nil {
-			log.Error(err, "failed to parse ignore-differences annotation")
-			return err
-		}
-		app.Spec.IgnoreDifferences = ignoreDifferences
+	// Resolve registry credentials from HelmRepository
+	creds, err := r.resolveRegistryCredentials(ctx, &helmRepo, hr.Namespace)
+	if err != nil {
+		log.Error(err, "failed to resolve registry credentials, proceeding without")
+	}
+
+	ignoreDiffs, err := ignoregen.DetectIgnoreDifferences(ctx, chartName, chartVersion, chartRepoURL, namespace, values.AsMap(), creds)
+	if err != nil {
+		log.Error(err, "failed to auto-detect ignoreDifferences, proceeding without")
+	} else {
+		app.Spec.IgnoreDifferences = ignoreDiffs
 	}
 
 	// Update HelmRelease status based on Application status
@@ -308,7 +282,7 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 	return nil
 }
 
-func (r *HelmReleaseReconciler) getHelmRepositoryURL(ctx context.Context, hr *fluxhelmv2.HelmRelease) (string, error) {
+func (r *HelmReleaseReconciler) getHelmRepository(ctx context.Context, hr *fluxhelmv2.HelmRelease) (string, fluxsrcv1.HelmRepository, error) {
 	var helmRepo fluxsrcv1.HelmRepository
 	sourceRef := hr.Spec.Chart.Spec.SourceRef
 
@@ -322,10 +296,68 @@ func (r *HelmReleaseReconciler) getHelmRepositoryURL(ctx context.Context, hr *fl
 		Name:      sourceRef.Name,
 		Namespace: namespace,
 	}, &helmRepo); err != nil {
-		return "", err
+		return "", helmRepo, err
 	}
 
-	return strings.TrimPrefix(helmRepo.Spec.URL, "oci://"), nil
+	return strings.TrimPrefix(helmRepo.Spec.URL, "oci://"), helmRepo, nil
+}
+
+// resolveRegistryCredentials reads SecretRef and CertSecretRef from HelmRepository
+// and returns credentials for OCI registry authentication.
+func (r *HelmReleaseReconciler) resolveRegistryCredentials(ctx context.Context, helmRepo *fluxsrcv1.HelmRepository, fallbackNS string) (*ignoregen.RegistryCredentials, error) {
+	var creds ignoregen.RegistryCredentials
+
+	repoNS := helmRepo.Namespace
+	if repoNS == "" {
+		repoNS = fallbackNS
+	}
+
+	// Read basic auth from SecretRef (username, password)
+	if helmRepo.Spec.SecretRef != nil {
+		var secret corev1.Secret
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      helmRepo.Spec.SecretRef.Name,
+			Namespace: repoNS,
+		}, &secret); err != nil {
+			return nil, fmt.Errorf("get secretRef %s/%s: %w", repoNS, helmRepo.Spec.SecretRef.Name, err)
+		}
+
+		creds.Username = string(secret.Data["username"])
+		creds.Password = string(secret.Data["password"])
+
+		// Legacy: caFile, certFile, keyFile in SecretRef
+		if len(creds.CACert) == 0 {
+			creds.CACert = secret.Data["caFile"]
+		}
+		if len(creds.ClientCert) == 0 {
+			creds.ClientCert = secret.Data["certFile"]
+		}
+		if len(creds.ClientKey) == 0 {
+			creds.ClientKey = secret.Data["keyFile"]
+		}
+	}
+
+	// Read TLS certs from CertSecretRef (tls.crt, tls.key, ca.crt) - takes precedence
+	if helmRepo.Spec.CertSecretRef != nil {
+		var certSecret corev1.Secret
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      helmRepo.Spec.CertSecretRef.Name,
+			Namespace: repoNS,
+		}, &certSecret); err != nil {
+			return nil, fmt.Errorf("get certSecretRef %s/%s: %w", repoNS, helmRepo.Spec.CertSecretRef.Name, err)
+		}
+
+		creds.CACert = certSecret.Data["ca.crt"]
+		creds.ClientCert = certSecret.Data["tls.crt"]
+		creds.ClientKey = certSecret.Data["tls.key"]
+	}
+
+	// Return nil if no credentials found
+	if creds.Username == "" && len(creds.CACert) == 0 && len(creds.ClientCert) == 0 {
+		return nil, nil
+	}
+
+	return &creds, nil
 }
 
 func (r *HelmReleaseReconciler) updateHelmReleaseStatus(ctx context.Context, hr *fluxhelmv2.HelmRelease, app *argov1a1.Application) error {

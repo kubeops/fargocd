@@ -1,9 +1,0 @@
-spec:
-  ignoreDifferences:
-  - group: kubedb.com
-    kind: Postgres
-    name: ace-db
-    namespace: ace
-    jqPathExpressions:
-    - .spec.podTemplate.spec.containers[] | select(.name == "postgres") | .securityContext
-    - .spec.podTemplate.spec.containers[] | select(.name == "pg-coordinator")
