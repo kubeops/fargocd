@@ -260,7 +260,7 @@ func TestReconcile_DependencyGate(t *testing.T) {
 	parentApp := &argov1a1.Application{
 		ObjectMeta: metav1.ObjectMeta{Name: "kubedb", Namespace: "argocd"},
 		Status: argov1a1.ApplicationStatus{
-			Health: argov1a1.HealthStatus{Status: health.HealthStatusProgressing},
+			Health: argov1a1.AppHealthStatus{Status: health.HealthStatusProgressing},
 		},
 	}
 
