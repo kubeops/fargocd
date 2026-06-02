@@ -359,12 +359,8 @@ func TestReconcile_AddsFinalizerIfMissing(t *testing.T) {
 		ArgoClient: c,
 		Mode:       mode.InCluster,
 	}
-	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "kubedb", Namespace: "default"}})
-	if err != nil {
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "kubedb", Namespace: "default"}}); err != nil {
 		t.Fatalf("reconcile: %v", err)
-	}
-	if !res.Requeue {
-		t.Errorf("expected Requeue after finalizer added, got %+v", res)
 	}
 
 	var post fluxhelmv2.HelmRelease
@@ -382,8 +378,7 @@ func TestReconcile_AddsFinalizerIfMissing(t *testing.T) {
 	}
 
 	var app argov1a1.Application
-	err = c.Get(context.Background(), types.NamespacedName{Name: "kubedb", Namespace: "argocd"}, &app)
-	if !apierrors.IsNotFound(err) {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "kubedb", Namespace: "argocd"}, &app); !apierrors.IsNotFound(err) {
 		t.Errorf("application created before second reconcile, err=%v", err)
 	}
 }

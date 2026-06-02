@@ -137,7 +137,10 @@ func (r *HelmReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if err := r.Update(ctx, &hr); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		// The Update above bumps the HelmRelease's resourceVersion which
+		// the informer's watch will deliver as a new reconcile request;
+		// no explicit requeue needed.
+		return ctrl.Result{}, nil
 	}
 
 	if hr.Spec.Suspend {
