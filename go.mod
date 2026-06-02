@@ -240,3 +240,11 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.1-0.20251003215857-446d8398e19c // indirect
 	x-helm.dev/apimachinery v0.0.17 // indirect
 )
+
+// argoproj/argo-cd/v3@v3.2.12 (and older) still calls the top-level
+// `securejoin.MkdirAll`, which was removed in
+// github.com/cyphar/filepath-securejoin v0.6.0 (moved to the
+// pathrs-lite subpackage). Until argo-cd v3 catches up, pin
+// securejoin to the last v0.5.x. go-git/go-billy v5.9.0 only uses
+// `securejoin.SecureJoin`, which is unchanged in v0.5.2.
+replace github.com/cyphar/filepath-securejoin => github.com/cyphar/filepath-securejoin v0.5.2
