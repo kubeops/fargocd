@@ -80,8 +80,17 @@ For a given `HelmRelease`:
    originating HelmRelease and, in managed mode, the
    `argocd.argoproj.io/agent-name` label so the principal can route the
    Application to the right agent.
-10. **Status mirror** — patch `HelmRelease.status.conditions` with `Ready`
-    (from Application sync) and `Reconciling` (from Application health).
+10. **Status mirror** — patch `HelmRelease.status.conditions` with:
+    - `Ready` (from `Application.status.sync.status`),
+    - `Reconciling` (from `Application.status.health.status`), and
+    - one condition per `Application.status.conditions[]` entry,
+      mirrored verbatim. Argo CD uses that array to surface things like
+      `ComparisonError`, `InvalidSpecError`, `SyncError`, and the
+      `SharedResource`/`Orphaned`/`Excluded`/`Repeated` resource
+      warnings; we copy the Type as the condition Type and Reason and
+      the Message as-is, so `kubectl describe helmrelease` shows the
+      actual underlying problem without the user having to fetch the
+      Application.
 
 ## Agent modes
 
@@ -199,5 +208,3 @@ without needing network access.
 - Support `HelmRelease.spec.chartRef` (currently only `spec.chart` with an
   `HelmRepository` source is honoured).
 - Project-per-HelmRelease and AppProject-template support.
-- Richer `Reconciling` condition that surfaces the Application's
-  `Conditions[]` (e.g. comparison errors) verbatim.
