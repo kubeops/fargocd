@@ -73,12 +73,12 @@ log "Starting fargocd in background (in-cluster mode)"
 # We point fargocd at the cluster via $KUBECONFIG. argo-namespace is
 # omitted so namespace auto-discovery is exercised end-to-end.
 ./bin/fargocd run \
-  --mode=in-cluster \
-  --metrics-bind-address=0 \
-  --health-probe-bind-address=0 \
-  --argo-dest-server=https://kubernetes.default.svc \
-  --argo-project=default \
-  >/tmp/fargocd.log 2>&1 &
+    --mode=in-cluster \
+    --metrics-bind-address=0 \
+    --health-probe-bind-address=0 \
+    --argo-dest-server=https://kubernetes.default.svc \
+    --argo-project=default \
+    >/tmp/fargocd.log 2>&1 &
 FARGOCD_PID=$!
 trap 'kill ${FARGOCD_PID} 2>/dev/null || true; echo "--- fargocd log tail ---"; tail -n 200 /tmp/fargocd.log || true' EXIT
 
@@ -89,20 +89,20 @@ kubectl apply -f "${FIXTURES_DIR}/helmrelease.yaml"
 
 log "Waiting for Application to appear in argocd"
 for i in $(seq 1 60); do
-  if kubectl get application e2e-demo -n argocd >/dev/null 2>&1; then
-    echo "Application e2e-demo found after ${i} attempts"
-    break
-  fi
-  if ! kill -0 "${FARGOCD_PID}" 2>/dev/null; then
-    echo "::error::fargocd process exited prematurely"
-    exit 1
-  fi
-  sleep 2
+    if kubectl get application e2e-demo -n argocd >/dev/null 2>&1; then
+        echo "Application e2e-demo found after ${i} attempts"
+        break
+    fi
+    if ! kill -0 "${FARGOCD_PID}" 2>/dev/null; then
+        echo "::error::fargocd process exited prematurely"
+        exit 1
+    fi
+    sleep 2
 done
 
 if ! kubectl get application e2e-demo -n argocd >/dev/null 2>&1; then
-  echo "::error::Application e2e-demo was not created within timeout"
-  exit 1
+    echo "::error::Application e2e-demo was not created within timeout"
+    exit 1
 fi
 
 log "Validating Application contents"
@@ -116,28 +116,43 @@ got_dest_ns=$(kubectl get application e2e-demo -n argocd -o jsonpath='{.spec.des
 got_dest_server=$(kubectl get application e2e-demo -n argocd -o jsonpath='{.spec.destination.server}')
 got_backlink=$(kubectl get application e2e-demo -n argocd -o jsonpath='{.metadata.annotations.fargocd\.appscode\.com/helmrelease}')
 
-[ "${got_chart}" = "cert-manager" ] || { echo "::error::expected chart=cert-manager got '${got_chart}'"; exit 1; }
-[ "${got_dest_ns}" = "cert-manager" ] || { echo "::error::expected destination.namespace=cert-manager got '${got_dest_ns}'"; exit 1; }
-[ "${got_dest_server}" = "https://kubernetes.default.svc" ] || { echo "::error::expected destination.server=https://kubernetes.default.svc got '${got_dest_server}'"; exit 1; }
-[ "${got_backlink}" = "flux-system/e2e-demo" ] || { echo "::error::expected backlink=flux-system/e2e-demo got '${got_backlink}'"; exit 1; }
+[ "${got_chart}" = "cert-manager" ] || {
+    echo "::error::expected chart=cert-manager got '${got_chart}'"
+    exit 1
+}
+[ "${got_dest_ns}" = "cert-manager" ] || {
+    echo "::error::expected destination.namespace=cert-manager got '${got_dest_ns}'"
+    exit 1
+}
+[ "${got_dest_server}" = "https://kubernetes.default.svc" ] || {
+    echo "::error::expected destination.server=https://kubernetes.default.svc got '${got_dest_server}'"
+    exit 1
+}
+[ "${got_backlink}" = "flux-system/e2e-demo" ] || {
+    echo "::error::expected backlink=flux-system/e2e-demo got '${got_backlink}'"
+    exit 1
+}
 
 log "Validating finalizer was added to the HelmRelease"
 got_finalizer=$(kubectl get helmrelease e2e-demo -n flux-system -o jsonpath='{.metadata.finalizers[?(@=="fargocd.appscode.com/finalizer")]}')
-[ -n "${got_finalizer}" ] || { echo "::error::fargocd.appscode.com/finalizer not present"; exit 1; }
+[ -n "${got_finalizer}" ] || {
+    echo "::error::fargocd.appscode.com/finalizer not present"
+    exit 1
+}
 
 log "Deleting HelmRelease — Application must be garbage-collected"
 kubectl delete helmrelease e2e-demo -n flux-system --wait=true
 for i in $(seq 1 30); do
-  if ! kubectl get application e2e-demo -n argocd >/dev/null 2>&1; then
-    echo "Application e2e-demo cleaned up after ${i} attempts"
-    break
-  fi
-  sleep 2
+    if ! kubectl get application e2e-demo -n argocd >/dev/null 2>&1; then
+        echo "Application e2e-demo cleaned up after ${i} attempts"
+        break
+    fi
+    sleep 2
 done
 
 if kubectl get application e2e-demo -n argocd >/dev/null 2>&1; then
-  echo "::error::Application e2e-demo was not cleaned up"
-  exit 1
+    echo "::error::Application e2e-demo was not cleaned up"
+    exit 1
 fi
 
 log "e2e smoke test passed"
