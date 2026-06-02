@@ -18,11 +18,13 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"kubeops.dev/fargocd/pkg/ignoregen"
+	"kubeops.dev/fargocd/pkg/mode"
 
 	argov1a1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/gitops-engine/pkg/health"
@@ -30,7 +32,7 @@ import (
 	"github.com/fluxcd/pkg/chartutil"
 	fluxsrcv1 "github.com/fluxcd/source-controller/api/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -45,149 +47,205 @@ import (
 )
 
 const (
-	finalizerName         = "helmrelease.finalizers.example.com"
-	helmReleaseAnnotation = "fargocd.appscode.com/helmrelease"
+	// FinalizerName ensures the bridge can clean up the Argo CD Application
+	// before the originating HelmRelease is removed.
+	FinalizerName = "fargocd.appscode.com/finalizer"
+
+	// HelmReleaseAnnotation links an Argo CD Application back to the
+	// HelmRelease that produced it. The value is "<namespace>/<name>".
+	HelmReleaseAnnotation = "fargocd.appscode.com/helmrelease"
+
+	// AgentNameLabel is set on Applications in managed mode so the
+	// argocd-agent principal can route them to the correct workload cluster.
+	AgentNameLabel = "argocd.argoproj.io/agent-name"
+
+	// DefaultRequeueAfter is used when a transient condition (such as a
+	// dependency not being healthy yet) makes us re-enqueue.
+	DefaultRequeueAfter = 30 * time.Second
+
+	// argoServerLabelKey/Value is what we look for to auto-discover the
+	// Argo CD namespace on the principal/local cluster.
+	argoServerLabelKey   = "app.kubernetes.io/name"
+	argoServerLabelValue = "argocd-server"
 )
 
+// HelmReleaseReconciler watches FluxCD HelmRelease objects and projects each
+// of them into an Argo CD Application on the cluster reached by ArgoClient.
 type HelmReleaseReconciler struct {
+	// Client is connected to the cluster that hosts the HelmRelease objects.
 	client.Client
-	Scheme            *runtime.Scheme
-	ArgoClient        client.Client
+
+	// Scheme used by the local manager.
+	Scheme *runtime.Scheme
+
+	// ArgoClient is connected to the cluster that hosts Argo CD. In
+	// InCluster and Autonomous mode this is the same cluster as Client. In
+	// Managed mode it is the remote principal.
+	ArgoClient client.Client
+
+	// Mode controls how Applications are constructed and where they are
+	// written.
+	Mode mode.Mode
+
+	// ArgoNamespace, if set, overrides automatic discovery of the Argo CD
+	// namespace.
+	ArgoNamespace string
+
+	// DestinationServer is the value written into Application.Spec.Destination.Server.
+	// Defaults to https://kubernetes.default.svc.
 	DestinationServer string
-	ClusterName       string
+
+	// DestinationName is the value written into Application.Spec.Destination.Name.
+	// Most useful in Managed mode where the principal references workload
+	// clusters by symbolic name.
+	DestinationName string
+
+	// Project is the Argo CD project assigned to generated Applications.
+	Project string
+
+	// ClusterName identifies the workload cluster. Required in Managed mode;
+	// optional otherwise. When non-empty it is used both as the suffix for
+	// the Application name (so multiple clusters can share one principal
+	// without colliding) and as the agent label value.
+	ClusterName string
 }
 
+// Reconcile implements the controller-runtime contract.
 func (r *HelmReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := log.FromContext(ctx)
+	logger := log.FromContext(ctx)
 
-	// Fetch the HelmRelease instance
 	var hr fluxhelmv2.HelmRelease
 	if err := r.Get(ctx, req.NamespacedName, &hr); err != nil {
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
-		log.Error(err, "unable to fetch HelmRelease")
 		return ctrl.Result{}, err
 	}
 
-	// Check if HelmRelease is being deleted
-	if hr.DeletionTimestamp != nil {
-		if controllerutil.ContainsFinalizer(&hr, finalizerName) {
-			// Cleanup the Application
-			if err := r.cleanupApplication(ctx, &hr); err != nil {
-				log.Error(err, "failed to cleanup Application")
-				return ctrl.Result{}, err
-			}
+	argoNamespace, err := r.resolveArgoNamespace(ctx)
+	if err != nil {
+		logger.Error(err, "failed to determine Argo CD namespace")
+		return ctrl.Result{RequeueAfter: DefaultRequeueAfter}, nil
+	}
 
-			// Remove finalizer
-			controllerutil.RemoveFinalizer(&hr, finalizerName)
-			if err := r.Update(ctx, &hr); err != nil {
-				log.Error(err, "failed to remove finalizer from HelmRelease")
-				return ctrl.Result{}, err
-			}
+	if !hr.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, &hr, argoNamespace)
+	}
+
+	if !controllerutil.ContainsFinalizer(&hr, FinalizerName) {
+		controllerutil.AddFinalizer(&hr, FinalizerName)
+		if err := r.Update(ctx, &hr); err != nil {
+			return ctrl.Result{}, err
 		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	if hr.Spec.Suspend {
+		logger.V(1).Info("HelmRelease is suspended, skipping")
 		return ctrl.Result{}, nil
 	}
 
-	// Add finalizer if not present
-	if !controllerutil.ContainsFinalizer(&hr, finalizerName) {
-		controllerutil.AddFinalizer(&hr, finalizerName)
-		if err := r.Update(ctx, &hr); err != nil {
-			log.Error(err, "failed to add finalizer to HelmRelease")
-			return ctrl.Result{}, err
-		}
+	if ok, unhealthy := r.checkDependenciesHealth(ctx, &hr, argoNamespace); !ok {
+		logger.Info("waiting for dependency Application to be Healthy", "dependency", unhealthy)
+		return ctrl.Result{RequeueAfter: DefaultRequeueAfter}, nil
 	}
 
-	// Get ArgoCD namespace
-	argoNamespace, err := r.getArgoCDNamespace(ctx)
-	if err != nil {
-		log.Error(err, "failed to determine ArgoCD namespace")
-		return ctrl.Result{}, err
-	}
-
-	// Check dependencies' health
-	if ok, unhealthyDep := r.checkDependenciesHealth(ctx, &hr, argoNamespace); !ok {
-		log.Info("Waiting for dependency Application to be Healthy", "unhealthy", unhealthyDep)
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-
-	// Create or update corresponding ArgoCD Application
-	app := &argov1a1.Application{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      r.appName(hr.Name),
-			Namespace: argoNamespace,
-		},
-	}
+	app := &argov1a1.Application{}
+	app.Name = r.appName(&hr)
+	app.Namespace = argoNamespace
 
 	op, err := controllerutil.CreateOrPatch(ctx, r.ArgoClient, app, func() error {
 		return r.syncApplication(ctx, app, &hr)
 	})
 	if err != nil {
-		log.Error(err, "failed to create/update Application")
+		logger.Error(err, "failed to create/update Application")
 		return ctrl.Result{}, err
 	}
+	logger.V(1).Info("application reconciled", "operation", op, "application", client.ObjectKeyFromObject(app))
 
-	// Update HelmRelease status based on Application status
 	if err := r.updateHelmReleaseStatus(ctx, &hr, app); err != nil {
-		log.Error(err, "failed to update HelmRelease status")
-		return ctrl.Result{}, err
+		// Status-only errors should not block reconciliation; surface them
+		// in the log and let the next reconcile reattempt.
+		logger.Error(err, "failed to update HelmRelease status")
 	}
 
-	log.Info("Application reconciled", "operation", op)
 	return ctrl.Result{}, nil
 }
 
-func (r *HelmReleaseReconciler) getArgoCDNamespace(ctx context.Context) (string, error) {
-	var serviceList corev1.ServiceList
-	if err := r.ArgoClient.List(ctx, &serviceList, client.MatchingLabels{"app.kubernetes.io/name": "argocd-server"}); err != nil {
+// reconcileDelete drops the Argo CD Application and releases the finalizer
+// so the HelmRelease can finalise.
+func (r *HelmReleaseReconciler) reconcileDelete(ctx context.Context, hr *fluxhelmv2.HelmRelease, argoNamespace string) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if controllerutil.ContainsFinalizer(hr, FinalizerName) {
+		if err := r.deleteApplication(ctx, hr, argoNamespace); err != nil {
+			logger.Error(err, "failed to delete Application")
+			return ctrl.Result{}, err
+		}
+		controllerutil.RemoveFinalizer(hr, FinalizerName)
+		if err := r.Update(ctx, hr); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
+// deleteApplication removes the Application that mirrors hr.
+func (r *HelmReleaseReconciler) deleteApplication(ctx context.Context, hr *fluxhelmv2.HelmRelease, argoNamespace string) error {
+	app := &argov1a1.Application{}
+	app.Name = r.appName(hr)
+	app.Namespace = argoNamespace
+	if err := r.ArgoClient.Delete(ctx, app); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+// appName projects an HelmRelease into an Application name. It honours the
+// multi-cluster naming rule documented in the Design doc.
+func (r *HelmReleaseReconciler) appName(hr *fluxhelmv2.HelmRelease) string {
+	return applicationName(hr, r.ClusterName)
+}
+
+// resolveArgoNamespace returns the explicitly configured namespace or, when
+// none is set, looks for an argocd-server Service on the Argo CD cluster.
+func (r *HelmReleaseReconciler) resolveArgoNamespace(ctx context.Context) (string, error) {
+	if r.ArgoNamespace != "" {
+		return r.ArgoNamespace, nil
+	}
+
+	var services corev1.ServiceList
+	if err := r.ArgoClient.List(ctx, &services, client.MatchingLabels{argoServerLabelKey: argoServerLabelValue}); err != nil {
 		return "", err
 	}
-
-	if len(serviceList.Items) == 0 {
-		return "", errors.NewNotFound(corev1.Resource("Service"), "argocd-server")
+	if len(services.Items) == 0 {
+		return "", apierrors.NewNotFound(corev1.Resource("Service"), argoServerLabelValue)
 	}
-
-	// Return the namespace of the first matching service
-	return serviceList.Items[0].Namespace, nil
+	return services.Items[0].Namespace, nil
 }
 
-func (r *HelmReleaseReconciler) appName(hrName string) string {
-	if hrName == "ace" {
-		return hrName
-	}
-	if r.ClusterName != "" {
-		return fmt.Sprintf("%s-%s", hrName, r.ClusterName)
-	}
-	return hrName
-}
-
+// checkDependenciesHealth verifies that every HelmRelease listed in
+// spec.dependsOn has produced a Healthy Application. The second return
+// value is the name of the first dependency we found unhealthy, useful for
+// log messages.
 func (r *HelmReleaseReconciler) checkDependenciesHealth(ctx context.Context, hr *fluxhelmv2.HelmRelease, argoNamespace string) (bool, string) {
 	if len(hr.Spec.DependsOn) == 0 {
 		return true, ""
 	}
 
 	for _, dep := range hr.Spec.DependsOn {
-		//depNamespace := hr.Namespace
-		//if dep.Namespace != "" {
-		//	depNamespace = dep.Namespace
-		//}
-		//depAppName := fmt.Sprintf("%s-%s", dep.Name, depNamespace)
+		depAppName := applicationName(&fluxhelmv2.HelmRelease{
+			ObjectMeta: metav1.ObjectMeta{Name: dep.Name, Namespace: hr.Namespace},
+		}, r.ClusterName)
 
-		depAppName := r.appName(dep.Name)
 		var depApp argov1a1.Application
-
-		if err := r.ArgoClient.Get(ctx, types.NamespacedName{
+		err := r.ArgoClient.Get(ctx, types.NamespacedName{
 			Name:      depAppName,
 			Namespace: argoNamespace,
-		}, &depApp); err != nil {
-			if errors.IsNotFound(err) {
-				return false, depAppName
-			}
-			log.FromContext(ctx).Error(err, "failed to check dependent Application", "app", depAppName)
+		}, &depApp)
+		if err != nil {
 			return false, depAppName
 		}
-
-		// Check if the dependent Application is Healthy
 		if depApp.Status.Health.Status != health.HealthStatusHealthy {
 			return false, depAppName
 		}
@@ -195,115 +253,142 @@ func (r *HelmReleaseReconciler) checkDependenciesHealth(ctx context.Context, hr 
 	return true, ""
 }
 
+// syncApplication populates the Application from the HelmRelease. It is
+// invoked under controllerutil.CreateOrPatch so it must be idempotent.
 func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1a1.Application, hr *fluxhelmv2.HelmRelease) error {
-	log := log.FromContext(ctx)
+	logger := log.FromContext(ctx)
 
-	// Get the HelmRepository
-	repoURL, helmRepo, err := r.getHelmRepository(ctx, hr)
-	if err != nil {
-		return err
+	if hr.Spec.Chart == nil {
+		return errors.New("HelmRelease.spec.chart is required (chartRef is not supported)")
 	}
 
-	// Ensure annotations map exists
+	repoURL, helmRepo, err := r.getHelmRepository(ctx, hr)
+	if err != nil {
+		return fmt.Errorf("resolve HelmRepository: %w", err)
+	}
+
+	// Annotations: link back to the originating HelmRelease so the watcher
+	// on Application can reverse-lookup the right reconcile request.
 	if app.Annotations == nil {
 		app.Annotations = make(map[string]string)
 	}
-
-	// Store HelmRelease namespace and name in annotation
-	helmReleaseRef, err := cache.MetaNamespaceKeyFunc(hr)
+	hrRef, err := cache.MetaNamespaceKeyFunc(hr)
 	if err != nil {
 		return err
 	}
-	app.Annotations[helmReleaseAnnotation] = helmReleaseRef
+	app.Annotations[HelmReleaseAnnotation] = hrRef
 
-	// Compose values based from the spec and references.
+	// Agent label is meaningful only in managed mode.
+	if r.Mode == mode.Managed && r.ClusterName != "" {
+		if app.Labels == nil {
+			app.Labels = make(map[string]string)
+		}
+		app.Labels[AgentNameLabel] = r.ClusterName
+	}
+
 	values, err := chartutil.ChartValuesFromReferences(ctx,
-		log,
+		logger,
 		r.Client,
 		hr.Namespace,
 		hr.GetValues(),
 		hr.Spec.ValuesFrom...)
 	if err != nil {
-		return err
+		return fmt.Errorf("compose values: %w", err)
 	}
-	raw, err := values.YAML()
+	rawValues, err := values.YAML()
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal values: %w", err)
+	}
+	// Empty values render as "{}\n" which Argo CD treats as a literal "{}"
+	// override rather than no overrides. Normalise to the empty string so
+	// Argo CD honours the chart defaults.
+	if strings.TrimSpace(rawValues) == "{}" {
+		rawValues = ""
 	}
 
-	// Set Application spec based on HelmRelease
+	project := r.Project
+	if project == "" {
+		project = "default"
+	}
+
+	destination := argov1a1.ApplicationDestination{
+		Namespace: hr.GetReleaseNamespace(),
+		Server:    r.DestinationServer,
+		Name:      r.DestinationName,
+	}
+	if destination.Server == "" && destination.Name == "" {
+		destination.Server = "https://kubernetes.default.svc"
+	}
+
 	app.Spec = argov1a1.ApplicationSpec{
-		Project: "default",
+		Project: project,
 		Source: &argov1a1.ApplicationSource{
-			RepoURL:        repoURL,
+			RepoURL:        strings.TrimPrefix(repoURL, "oci://"),
 			Chart:          hr.Spec.Chart.Spec.Chart,
 			TargetRevision: hr.Spec.Chart.Spec.Version,
 			Helm: &argov1a1.ApplicationSourceHelm{
-				Values: raw,
+				ReleaseName: hr.GetReleaseName(),
+				Values:      rawValues,
 			},
 		},
-		Destination: argov1a1.ApplicationDestination{
-			Server:    r.DestinationServer,
-			Namespace: hr.GetReleaseNamespace(),
-		},
+		Destination: destination,
 		SyncPolicy: &argov1a1.SyncPolicy{
-			Automated: &argov1a1.SyncPolicyAutomated{},
+			Automated: &argov1a1.SyncPolicyAutomated{
+				Prune:    true,
+				SelfHeal: true,
+			},
 			SyncOptions: argov1a1.SyncOptions{
 				"CreateNamespace=true",
+				"ServerSideApply=true",
 			},
 		},
 	}
 
-	// Auto-detect ignoreDifferences by rendering the chart twice
-	chartName := hr.Spec.Chart.Spec.Chart
-	chartVersion := hr.Spec.Chart.Spec.Version
-	chartRepoURL := strings.TrimPrefix(repoURL, "oci://")
-	namespace := hr.GetReleaseNamespace()
-
-	// Resolve registry credentials from HelmRepository
+	// Auto-detect ignoreDifferences for fields that mutate on every render
+	// (CA bundles, generated certs, etc).
 	creds, err := r.resolveRegistryCredentials(ctx, &helmRepo, hr.Namespace)
 	if err != nil {
-		log.Error(err, "failed to resolve registry credentials, proceeding without")
+		logger.Error(err, "failed to resolve registry credentials; proceeding without auth")
 	}
-
-	ignoreDiffs, err := ignoregen.DetectIgnoreDifferences(ctx, chartName, chartVersion, chartRepoURL, namespace, values.AsMap(), creds)
+	rules, err := ignoregen.DetectIgnoreDifferences(
+		ctx,
+		hr.Spec.Chart.Spec.Chart,
+		hr.Spec.Chart.Spec.Version,
+		strings.TrimPrefix(repoURL, "oci://"),
+		hr.GetReleaseNamespace(),
+		values.AsMap(),
+		creds,
+	)
 	if err != nil {
-		log.Error(err, "failed to auto-detect ignoreDifferences, proceeding without")
+		logger.Error(err, "failed to auto-detect ignoreDifferences; proceeding without")
 	} else {
-		app.Spec.IgnoreDifferences = ignoreDiffs
-	}
-
-	// Update HelmRelease status based on Application status
-	if err := r.updateHelmReleaseStatus(ctx, hr, app); err != nil {
-		log.Error(err, "failed to update HelmRelease status")
-		return err
+		app.Spec.IgnoreDifferences = rules
 	}
 
 	return nil
 }
 
+// getHelmRepository looks up the HelmRepository referenced by hr and returns
+// its URL plus the resource itself (so credentials can be resolved).
 func (r *HelmReleaseReconciler) getHelmRepository(ctx context.Context, hr *fluxhelmv2.HelmRelease) (string, fluxsrcv1.HelmRepository, error) {
 	var helmRepo fluxsrcv1.HelmRepository
-	sourceRef := hr.Spec.Chart.Spec.SourceRef
 
-	// Use the HelmRelease's namespace if not specified in SourceRef
-	namespace := hr.Namespace
+	sourceRef := hr.Spec.Chart.Spec.SourceRef
+	ns := hr.Namespace
 	if sourceRef.Namespace != "" {
-		namespace = sourceRef.Namespace
+		ns = sourceRef.Namespace
 	}
 
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      sourceRef.Name,
-		Namespace: namespace,
-	}, &helmRepo); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: sourceRef.Name, Namespace: ns}, &helmRepo); err != nil {
 		return "", helmRepo, err
 	}
-
-	return strings.TrimPrefix(helmRepo.Spec.URL, "oci://"), helmRepo, nil
+	return helmRepo.Spec.URL, helmRepo, nil
 }
 
-// resolveRegistryCredentials reads SecretRef and CertSecretRef from HelmRepository
-// and returns credentials for OCI registry authentication.
+// resolveRegistryCredentials inspects HelmRepository.SecretRef and
+// CertSecretRef and returns the corresponding registry credentials. Either
+// reference can be omitted; a nil return means no credentials were
+// configured.
 func (r *HelmReleaseReconciler) resolveRegistryCredentials(ctx context.Context, helmRepo *fluxsrcv1.HelmRepository, fallbackNS string) (*ignoregen.RegistryCredentials, error) {
 	var creds ignoregen.RegistryCredentials
 
@@ -312,7 +397,6 @@ func (r *HelmReleaseReconciler) resolveRegistryCredentials(ctx context.Context, 
 		repoNS = fallbackNS
 	}
 
-	// Read basic auth from SecretRef (username, password)
 	if helmRepo.Spec.SecretRef != nil {
 		var secret corev1.Secret
 		if err := r.Get(ctx, types.NamespacedName{
@@ -321,23 +405,13 @@ func (r *HelmReleaseReconciler) resolveRegistryCredentials(ctx context.Context, 
 		}, &secret); err != nil {
 			return nil, fmt.Errorf("get secretRef %s/%s: %w", repoNS, helmRepo.Spec.SecretRef.Name, err)
 		}
-
 		creds.Username = string(secret.Data["username"])
 		creds.Password = string(secret.Data["password"])
-
-		// Legacy: caFile, certFile, keyFile in SecretRef
-		if len(creds.CACert) == 0 {
-			creds.CACert = secret.Data["caFile"]
-		}
-		if len(creds.ClientCert) == 0 {
-			creds.ClientCert = secret.Data["certFile"]
-		}
-		if len(creds.ClientKey) == 0 {
-			creds.ClientKey = secret.Data["keyFile"]
-		}
+		creds.CACert = secret.Data["caFile"]
+		creds.ClientCert = secret.Data["certFile"]
+		creds.ClientKey = secret.Data["keyFile"]
 	}
 
-	// Read TLS certs from CertSecretRef (tls.crt, tls.key, ca.crt) - takes precedence
 	if helmRepo.Spec.CertSecretRef != nil {
 		var certSecret corev1.Secret
 		if err := r.Get(ctx, types.NamespacedName{
@@ -346,162 +420,148 @@ func (r *HelmReleaseReconciler) resolveRegistryCredentials(ctx context.Context, 
 		}, &certSecret); err != nil {
 			return nil, fmt.Errorf("get certSecretRef %s/%s: %w", repoNS, helmRepo.Spec.CertSecretRef.Name, err)
 		}
-
-		creds.CACert = certSecret.Data["ca.crt"]
-		creds.ClientCert = certSecret.Data["tls.crt"]
-		creds.ClientKey = certSecret.Data["tls.key"]
+		// CertSecretRef takes precedence over SecretRef for TLS material.
+		if v := certSecret.Data["ca.crt"]; len(v) > 0 {
+			creds.CACert = v
+		}
+		if v := certSecret.Data["tls.crt"]; len(v) > 0 {
+			creds.ClientCert = v
+		}
+		if v := certSecret.Data["tls.key"]; len(v) > 0 {
+			creds.ClientKey = v
+		}
 	}
 
-	// Return nil if no credentials found
 	if creds.Username == "" && len(creds.CACert) == 0 && len(creds.ClientCert) == 0 {
 		return nil, nil
 	}
-
 	return &creds, nil
 }
 
+// updateHelmReleaseStatus mirrors the Application's sync and health state
+// onto the HelmRelease's standard Conditions.
 func (r *HelmReleaseReconciler) updateHelmReleaseStatus(ctx context.Context, hr *fluxhelmv2.HelmRelease, app *argov1a1.Application) error {
-	// Map ArgoCD Application conditions to standard conditions
-	var conditions []metav1.Condition
+	conditions := make([]metav1.Condition, 0, 2)
+	now := metav1.Now()
 
-	// Sync status condition
 	if app.Status.Sync.Status != "" {
-		status := metav1.ConditionFalse
-		switch app.Status.Sync.Status {
-		case argov1a1.SyncStatusCodeSynced:
-			status = metav1.ConditionTrue
-		case argov1a1.SyncStatusCodeOutOfSync:
-			status = metav1.ConditionFalse
+		readyStatus := metav1.ConditionFalse
+		if app.Status.Sync.Status == argov1a1.SyncStatusCodeSynced {
+			readyStatus = metav1.ConditionTrue
 		}
-
 		conditions = append(conditions, metav1.Condition{
 			Type:               "Ready",
-			Status:             status,
+			Status:             readyStatus,
 			Reason:             string(app.Status.Sync.Status),
-			Message:            "Synced with ArgoCD Application",
-			LastTransitionTime: metav1.Now(),
+			Message:            "synced state mirrored from Argo CD Application",
+			LastTransitionTime: now,
 		})
 	}
 
-	// Health status condition
 	if app.Status.Health.Status != "" {
-		status := metav1.ConditionTrue
+		reconciling := metav1.ConditionTrue
 		reason := string(app.Status.Health.Status)
-
 		switch app.Status.Health.Status {
 		case health.HealthStatusHealthy:
-			status = metav1.ConditionFalse
+			reconciling = metav1.ConditionFalse
 			reason = "Healthy"
 		case health.HealthStatusDegraded:
 			reason = "Degraded"
 		case health.HealthStatusProgressing:
 			reason = "Progressing"
 		}
-
 		conditions = append(conditions, metav1.Condition{
 			Type:               "Reconciling",
-			Status:             status,
+			Status:             reconciling,
 			Reason:             reason,
-			Message:            "Health status from ArgoCD Application",
-			LastTransitionTime: metav1.Now(),
+			Message:            "health state mirrored from Argo CD Application",
+			LastTransitionTime: now,
 		})
 	}
 
-	// Update HelmRelease status
-	hrCopy := hr.DeepCopy()
-	hrCopy.Status.Conditions = conditions
-
-	// Set LastAppliedRevision if synced
+	patch := client.MergeFrom(hr.DeepCopy())
+	hr.Status.Conditions = conditions
 	if app.Status.Sync.Status == argov1a1.SyncStatusCodeSynced {
-		hrCopy.Status.LastAttemptedRevision = app.Status.Sync.Revision
+		hr.Status.LastAttemptedRevision = app.Status.Sync.Revision
 	}
-
-	return r.Status().Update(ctx, hrCopy)
+	return r.Status().Patch(ctx, hr, patch)
 }
 
-func (r *HelmReleaseReconciler) cleanupApplication(ctx context.Context, hr *fluxhelmv2.HelmRelease) error {
-	app := &argov1a1.Application{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      hr.Name,
-			Namespace: hr.Namespace,
-		},
-	}
-
-	if err := r.ArgoClient.Delete(ctx, app); err != nil && !errors.IsNotFound(err) {
-		return err
-	}
-	return nil
-}
-
+// SetupWithManager wires watches for HelmRelease, HelmRepository, the Argo
+// CD Application that mirrors each HelmRelease, and the argocd-server
+// Service used for namespace auto-discovery.
 func (r *HelmReleaseReconciler) SetupWithManager(mgr, argoMgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&fluxhelmv2.HelmRelease{}).
+		// Re-reconcile when the mirrored Application changes (status, etc).
 		WatchesRawSource(source.Kind[client.Object](
 			argoMgr.GetCache(),
 			&argov1a1.Application{},
-			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []ctrl.Request {
-				ns, name, err := cache.SplitMetaNamespaceKey(o.GetAnnotations()[helmReleaseAnnotation])
+			handler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []ctrl.Request {
+				ref, ok := o.GetAnnotations()[HelmReleaseAnnotation]
+				if !ok {
+					return nil
+				}
+				ns, name, err := cache.SplitMetaNamespaceKey(ref)
 				if err != nil {
 					return nil
 				}
-				return []ctrl.Request{
-					{
-						NamespacedName: types.NamespacedName{
-							Name:      name,
-							Namespace: ns,
-						},
-					},
-				}
+				return []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}}}
 			}),
 		)).
+		// HelmRepository changes (URL, credentials) require a re-render.
 		Watches(
 			&fluxsrcv1.HelmRepository{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []ctrl.Request {
 				var hrList fluxhelmv2.HelmReleaseList
 				if err := r.List(ctx, &hrList); err != nil {
-					req := make([]ctrl.Request, 0, len(hrList.Items))
-					for _, hr := range hrList.Items {
-						if hr.Spec.Chart != nil &&
-							hr.Spec.Chart.Spec.SourceRef.Kind == fluxsrcv1.HelmRepositoryKind &&
-							hr.Spec.Chart.Spec.SourceRef.Name == o.GetName() &&
-							hr.Spec.Chart.Spec.SourceRef.Namespace == o.GetNamespace() {
-							req = append(req, ctrl.Request{
-								NamespacedName: types.NamespacedName{
-									Name:      hr.Name,
-									Namespace: hr.Namespace,
-								},
-							})
-						}
-					}
-					return req
+					return nil
 				}
-
-				return nil
+				reqs := make([]ctrl.Request, 0, len(hrList.Items))
+				for _, hr := range hrList.Items {
+					if hr.Spec.Chart == nil {
+						continue
+					}
+					ref := hr.Spec.Chart.Spec.SourceRef
+					if ref.Kind != fluxsrcv1.HelmRepositoryKind || ref.Name != o.GetName() {
+						continue
+					}
+					refNS := ref.Namespace
+					if refNS == "" {
+						refNS = hr.Namespace
+					}
+					if refNS != o.GetNamespace() {
+						continue
+					}
+					reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{
+						Name:      hr.Name,
+						Namespace: hr.Namespace,
+					}})
+				}
+				return reqs
 			}),
 		).
+		// The argocd-server Service is observed so we can rediscover the
+		// Argo CD namespace if it moves.
 		WatchesRawSource(source.Kind[client.Object](
 			argoMgr.GetCache(),
 			&corev1.Service{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []ctrl.Request {
-				obj := o.(*corev1.Service)
-				if obj.Labels["app.kubernetes.io/name"] != "argocd-server" {
+				if o.GetLabels()[argoServerLabelKey] != argoServerLabelValue {
 					return nil
 				}
-
 				var hrList fluxhelmv2.HelmReleaseList
 				if err := r.List(ctx, &hrList); err != nil {
-					req := make([]ctrl.Request, 0, len(hrList.Items))
-					for _, hr := range hrList.Items {
-						req = append(req, ctrl.Request{
-							NamespacedName: types.NamespacedName{
-								Name:      hr.Name,
-								Namespace: hr.Namespace,
-							},
-						})
-					}
-					return req
+					return nil
 				}
-				return nil
+				reqs := make([]ctrl.Request, 0, len(hrList.Items))
+				for _, hr := range hrList.Items {
+					reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{
+						Name:      hr.Name,
+						Namespace: hr.Namespace,
+					}})
+				}
+				return reqs
 			}),
 			predicate.LabelChangedPredicate{},
 		)).

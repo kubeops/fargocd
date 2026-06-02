@@ -72,9 +72,21 @@ var (
 	cache = make(map[cacheKey][]argov1a1.ResourceIgnoreDifferences)
 )
 
+// DetectFn is the function used to render the chart and compute
+// ignoreDifferences. It exists as a package variable so tests can stub the
+// helm-pull/render pipeline (which would otherwise need network access).
+//
+// Set this variable in test setup with t.Cleanup to restore the default.
+var DetectFn = detectIgnoreDifferences
+
 // DetectIgnoreDifferences renders a chart twice and returns ignoreDifferences
-// for fields that change between renders.
-func DetectIgnoreDifferences(ctx context.Context, chartName, chartVersion, repoURL, namespace string, values map[string]interface{}, creds *RegistryCredentials) ([]argov1a1.ResourceIgnoreDifferences, error) {
+// for fields that change between renders. Result are memoised per (chart,
+// version, repoURL, namespace).
+func DetectIgnoreDifferences(ctx context.Context, chartName, chartVersion, repoURL, namespace string, values map[string]any, creds *RegistryCredentials) ([]argov1a1.ResourceIgnoreDifferences, error) {
+	return DetectFn(ctx, chartName, chartVersion, repoURL, namespace, values, creds)
+}
+
+func detectIgnoreDifferences(ctx context.Context, chartName, chartVersion, repoURL, namespace string, values map[string]any, creds *RegistryCredentials) ([]argov1a1.ResourceIgnoreDifferences, error) {
 	key := cacheKey{chartName, chartVersion, repoURL, namespace}
 
 	mu.RLock()
@@ -105,7 +117,7 @@ func DetectIgnoreDifferences(ctx context.Context, chartName, chartVersion, repoU
 	return rules, nil
 }
 
-func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespace string, values map[string]interface{}, creds *RegistryCredentials) (string, error) {
+func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespace string, values map[string]any, creds *RegistryCredentials) (string, error) {
 	settings := cli.New()
 
 	// Build registry client options
@@ -138,7 +150,7 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 	actionConfig := new(action.Configuration)
 	actionConfig.Releases = storage.Init(driver.NewMemory())
 	actionConfig.KubeClient = &noopKubeClient{}
-	actionConfig.Log = func(format string, v ...interface{}) {}
+	actionConfig.Log = func(format string, v ...any) {}
 	actionConfig.RegistryClient = regClient
 
 	// Pull chart
@@ -151,7 +163,7 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 	if err != nil {
 		return "", fmt.Errorf("temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 	pullClient.DestDir = tmpDir
 
 	chartRef := fmt.Sprintf("oci://%s/%s", repoURL, chartName)
@@ -204,10 +216,10 @@ type Resource struct {
 	Kind      string
 	Name      string
 	Namespace string
-	Data      interface{}
-	Spec      interface{}
-	Metadata  map[string]interface{}
-	Raw       map[string]interface{}
+	Data      any
+	Spec      any
+	Metadata  map[string]any
+	Raw       map[string]any
 }
 
 func (r *Resource) Key() string {
@@ -224,14 +236,14 @@ func parseResources(rendered string) map[string]*Resource {
 			continue
 		}
 
-		var raw map[string]interface{}
+		var raw map[string]any
 		if err := yaml.Unmarshal([]byte(doc), &raw); err != nil {
 			continue
 		}
 
 		apiVersion, _ := raw["apiVersion"].(string)
 		kind, _ := raw["kind"].(string)
-		metadata, _ := raw["metadata"].(map[string]interface{})
+		metadata, _ := raw["metadata"].(map[string]any)
 		name, _ := metadata["name"].(string)
 		ns, _ := metadata["namespace"].(string)
 
@@ -402,8 +414,8 @@ func findIgnoreDifferences(renders []string) []argov1a1.ResourceIgnoreDifference
 	return rules
 }
 
-func isCertificateData(data interface{}) bool {
-	m, ok := data.(map[string]interface{})
+func isCertificateData(data any) bool {
+	m, ok := data.(map[string]any)
 	if !ok {
 		return false
 	}
@@ -416,9 +428,9 @@ func isCertificateData(data interface{}) bool {
 	return false
 }
 
-func diffAnnotations(metaA, metaB map[string]interface{}, prefix string) []string {
-	annA, _ := metaA["annotations"].(map[string]interface{})
-	annB, _ := metaB["annotations"].(map[string]interface{})
+func diffAnnotations(metaA, metaB map[string]any, prefix string) []string {
+	annA, _ := metaA["annotations"].(map[string]any)
+	annB, _ := metaB["annotations"].(map[string]any)
 	if annA == nil || annB == nil {
 		return nil
 	}
@@ -437,21 +449,21 @@ func diffAnnotations(metaA, metaB map[string]interface{}, prefix string) []strin
 	return diffs
 }
 
-func diffTemplateAnnotations(specA, specB interface{}) []string {
-	sA, _ := specA.(map[string]interface{})
-	sB, _ := specB.(map[string]interface{})
+func diffTemplateAnnotations(specA, specB any) []string {
+	sA, _ := specA.(map[string]any)
+	sB, _ := specB.(map[string]any)
 	if sA == nil || sB == nil {
 		return nil
 	}
 
-	tplA, _ := sA["template"].(map[string]interface{})
-	tplB, _ := sB["template"].(map[string]interface{})
+	tplA, _ := sA["template"].(map[string]any)
+	tplB, _ := sB["template"].(map[string]any)
 	if tplA == nil || tplB == nil {
 		return nil
 	}
 
-	metaA, _ := tplA["metadata"].(map[string]interface{})
-	metaB, _ := tplB["metadata"].(map[string]interface{})
+	metaA, _ := tplA["metadata"].(map[string]any)
+	metaB, _ := tplB["metadata"].(map[string]any)
 	if metaA == nil || metaB == nil {
 		return nil
 	}
@@ -459,20 +471,20 @@ func diffTemplateAnnotations(specA, specB interface{}) []string {
 	return diffAnnotations(metaA, metaB, "/spec/template/metadata/annotations")
 }
 
-func hasWebhookCaBundleDiff(a, b map[string]interface{}) bool {
-	webhooksA, _ := a["webhooks"].([]interface{})
-	webhooksB, _ := b["webhooks"].([]interface{})
+func hasWebhookCaBundleDiff(a, b map[string]any) bool {
+	webhooksA, _ := a["webhooks"].([]any)
+	webhooksB, _ := b["webhooks"].([]any)
 	if len(webhooksA) != len(webhooksB) {
 		return false
 	}
 	for i := 0; i < len(webhooksA); i++ {
-		whA, _ := webhooksA[i].(map[string]interface{})
-		whB, _ := webhooksB[i].(map[string]interface{})
+		whA, _ := webhooksA[i].(map[string]any)
+		whB, _ := webhooksB[i].(map[string]any)
 		if whA == nil || whB == nil {
 			continue
 		}
-		ccA, _ := whA["clientConfig"].(map[string]interface{})
-		ccB, _ := whB["clientConfig"].(map[string]interface{})
+		ccA, _ := whA["clientConfig"].(map[string]any)
+		ccB, _ := whB["clientConfig"].(map[string]any)
 		if ccA == nil || ccB == nil {
 			continue
 		}
@@ -485,9 +497,9 @@ func hasWebhookCaBundleDiff(a, b map[string]interface{}) bool {
 	return false
 }
 
-func hasAPICaBundleDiff(a, b interface{}) bool {
-	specA, _ := a.(map[string]interface{})
-	specB, _ := b.(map[string]interface{})
+func hasAPICaBundleDiff(a, b any) bool {
+	specA, _ := a.(map[string]any)
+	specB, _ := b.(map[string]any)
 	if specA == nil || specB == nil {
 		return false
 	}
@@ -496,7 +508,7 @@ func hasAPICaBundleDiff(a, b interface{}) bool {
 	return cbA != "" && cbB != "" && cbA != cbB
 }
 
-func deepEqualJSON(a, b interface{}) bool {
+func deepEqualJSON(a, b any) bool {
 	if a == nil && b == nil {
 		return true
 	}

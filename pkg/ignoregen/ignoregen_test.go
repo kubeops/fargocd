@@ -131,12 +131,12 @@ func renderChartTest(t *testing.T, c chartEntry, renderCount int) []string {
 	actionConfig := new(action.Configuration)
 	actionConfig.Releases = storage.Init(driver.NewMemory())
 	actionConfig.KubeClient = &noopKubeClient{}
-	actionConfig.Log = func(format string, v ...interface{}) {}
+	actionConfig.Log = func(format string, v ...any) {}
 	actionConfig.RegistryClient = regClient
 
-	values := make(map[string]interface{})
+	values := make(map[string]any)
 	if c.AceUserRoles {
-		values["ace-user-roles"] = map[string]interface{}{"enabled": false}
+		values["ace-user-roles"] = map[string]any{"enabled": false}
 	}
 
 	var manifests []string
