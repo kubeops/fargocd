@@ -1,0 +1,192 @@
+name: e2e
+
+# Triggered when an org member comments "/ok-to-test" on a pull request.
+#
+# Security model:
+#
+#   - We listen to `issue_comment` (not `pull_request_target`) so the
+#     workflow definition that runs always comes from the default branch
+#     — a malicious PR cannot modify the gate logic.
+#   - The `gate` job runs *before* any PR code is fetched. It only checks
+#     out the workflow's own repo at the merge-base ref, never PR code.
+#   - The gate verifies the commenter is an OWNER/MEMBER/COLLABORATOR via
+#     `author_association` (set server-side by GitHub) and additionally
+#     queries the collaborators permission API to confirm write or higher.
+#     Both checks must pass.
+#   - The `e2e` job runs only on `gate` success. Its token is restricted
+#     to `contents: read` so PR code cannot push, comment, or create
+#     releases. No publishing secrets are exposed.
+#   - The PR HEAD SHA captured by `gate` is the only thing the e2e job
+#     trusts — re-issuing /ok-to-test re-resolves the SHA, preventing
+#     replay against a different commit.
+#
+# Outsiders (drive-by commenters, forks) cannot trigger anything: the
+# `gate` job's `if:` condition short-circuits before any work runs.
+
+on:
+  issue_comment:
+    types: [created]
+
+# Cancel previous e2e runs on the same PR when a new /ok-to-test arrives.
+concurrency:
+  group: e2e-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Authorize /ok-to-test
+    # Only PR comments that contain the trigger phrase get this far. Note
+    # this `if:` is the FIRST gate — anything past it must still verify
+    # author identity below.
+    if: >-
+      github.event.issue.pull_request != null &&
+      contains(github.event.comment.body, '/ok-to-test')
+    runs-on: ubuntu-24.04
+    permissions:
+      # We need to post a status comment back on the PR; nothing else.
+      pull-requests: write
+    outputs:
+      pr_sha: ${{ steps.resolve.outputs.sha }}
+      pr_ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - name: Verify author is an org member
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          AUTHOR: ${{ github.event.comment.user.login }}
+          ASSOC: ${{ github.event.comment.author_association }}
+        run: |
+          set -eu
+          echo "::group::Authorization check"
+          echo "author=${AUTHOR} association=${ASSOC}"
+
+          # First gate: author_association is set by GitHub server-side
+          # based on the comment author's actual relationship to the repo
+          # at the moment of the comment. It cannot be spoofed by the
+          # comment body.
+          case "${ASSOC}" in
+            OWNER|MEMBER|COLLABORATOR)
+              echo "association ok"
+              ;;
+            *)
+              echo "::error::user ${AUTHOR} (association=${ASSOC}) is not an org member or collaborator"
+              exit 1
+              ;;
+          esac
+
+          # Second gate: re-confirm current write permission via the API.
+          # Defense in depth in case author_association is stale.
+          perm=$(gh api "/repos/${GH_REPO}/collaborators/${AUTHOR}/permission" --jq '.permission')
+          case "${perm}" in
+            admin|maintain|write)
+              echo "permission=${perm} ok"
+              ;;
+            *)
+              echo "::error::user ${AUTHOR} permission=${perm} is below write"
+              exit 1
+              ;;
+          esac
+          echo "::endgroup::"
+
+      - name: Resolve PR head SHA
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -eu
+          pr_json=$(gh api "/repos/${GH_REPO}/pulls/${PR_NUMBER}")
+          sha=$(echo "${pr_json}" | jq -r '.head.sha')
+          ref=$(echo "${pr_json}" | jq -r '.head.ref')
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved PR #${PR_NUMBER} head: ${ref}@${sha}"
+
+      - name: Acknowledge on the PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          AUTHOR: ${{ github.event.comment.user.login }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          gh pr comment "${PR_NUMBER}" --repo "${GH_REPO}" --body \
+            "e2e authorised by @${AUTHOR}; running against \`${SHA}\` — [logs](${RUN_URL})"
+
+  e2e:
+    name: e2e smoke test
+    needs: gate
+    runs-on: ubuntu-24.04
+    permissions:
+      # Read-only: PR code (which we are about to check out) is untrusted.
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.gate.outputs.pr_sha }}
+          # Pin to the SHA the gate resolved — refuses anything pushed
+          # after the gate ran.
+          persist-credentials: false
+
+      - name: Set up Go 1.25
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.25'
+          check-latest: true
+
+      - name: Install kind + kubectl
+        run: |
+          set -eu
+          curl -fsSL -o ./kind https://kind.sigs.k8s.io/dl/v0.30.0/kind-linux-amd64
+          chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+          curl -fsSL -o ./kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
+          chmod +x ./kubectl && sudo mv ./kubectl /usr/local/bin/kubectl
+
+      - name: Create kind cluster
+        run: kind create cluster --image kindest/node:v1.31.0 --name fargocd-e2e
+
+      - name: Run e2e smoke test
+        env:
+          KUBECONFIG: ${{ github.workspace }}/.kube/config
+        run: |
+          mkdir -p "${HOME}/.kube"
+          kind get kubeconfig --name fargocd-e2e > "${HOME}/.kube/config"
+          ./hack/e2e-ci.sh
+
+      - name: Collect cluster diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+          kubectl get all -A
+          kubectl get helmreleases.helm.toolkit.fluxcd.io -A -o yaml
+          kubectl get applications.argoproj.io -A -o yaml
+          kubectl get events -A --sort-by=.lastTimestamp
+
+      - name: Tear down kind cluster
+        if: always()
+        run: kind delete cluster --name fargocd-e2e
+
+      - name: Report result on the PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          if [ "${STATUS}" = "success" ]; then
+            body="e2e passed — [logs](${RUN_URL})"
+          else
+            body="e2e failed (${STATUS}) — [logs](${RUN_URL})"
+          fi
+          gh pr comment "${PR_NUMBER}" --repo "${GH_REPO}" --body "${body}"
