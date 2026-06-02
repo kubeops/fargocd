@@ -441,10 +441,22 @@ func (r *HelmReleaseReconciler) resolveRegistryCredentials(ctx context.Context, 
 	return &creds, nil
 }
 
-// updateHelmReleaseStatus mirrors the Application's sync and health state
-// onto the HelmRelease's standard Conditions.
+// updateHelmReleaseStatus mirrors the Application's sync, health, and
+// per-application conditions onto the HelmRelease's standard Conditions.
+//
+// Three groups of conditions are written:
+//
+//  1. Ready — derived from Application.status.sync.status.
+//  2. Reconciling — derived from Application.status.health.status.
+//  3. One condition per Application.status.conditions[] entry, mirrored
+//     verbatim (the Argo CD Type becomes the metav1.Condition Type and
+//     Reason; the Argo CD Message is copied as-is). Argo CD uses these
+//     to surface ComparisonError, InvalidSpecError, SyncError, the
+//     SharedResource/Orphaned/Excluded/Repeated resource warnings, etc.
+//     Their presence is what indicates the condition is active, so they
+//     are mirrored with Status=True.
 func (r *HelmReleaseReconciler) updateHelmReleaseStatus(ctx context.Context, hr *fluxhelmv2.HelmRelease, app *argov1a1.Application) error {
-	conditions := make([]metav1.Condition, 0, 2)
+	conditions := make([]metav1.Condition, 0, 2+len(app.Status.Conditions))
 	now := metav1.Now()
 
 	if app.Status.Sync.Status != "" {
@@ -479,6 +491,23 @@ func (r *HelmReleaseReconciler) updateHelmReleaseStatus(ctx context.Context, hr 
 			Reason:             reason,
 			Message:            "health state mirrored from Argo CD Application",
 			LastTransitionTime: now,
+		})
+	}
+
+	for _, c := range app.Status.Conditions {
+		if c.Type == "" {
+			continue
+		}
+		t := now
+		if c.LastTransitionTime != nil {
+			t = *c.LastTransitionTime
+		}
+		conditions = append(conditions, metav1.Condition{
+			Type:               c.Type,
+			Status:             metav1.ConditionTrue,
+			Reason:             c.Type,
+			Message:            c.Message,
+			LastTransitionTime: t,
 		})
 	}
 

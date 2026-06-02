@@ -414,4 +414,79 @@ func TestReconcile_SuspendedSkipsApplication(t *testing.T) {
 	}
 }
 
+// TestStatusMirrorsApplicationConditions exercises updateHelmReleaseStatus
+// directly: it must propagate Application.status.conditions[] entries
+// (e.g. ComparisonError) verbatim onto the HelmRelease's conditions, in
+// addition to the Ready/Reconciling pair derived from sync/health.
+func TestStatusMirrorsApplicationConditions(t *testing.T) {
+	stubIgnoreDetect(t)
+	sch := newScheme(t)
+
+	hr := sampleHelmRelease("kubedb", "kubedb")
+	c := fake.NewClientBuilder().
+		WithScheme(sch).
+		WithObjects(hr).
+		WithStatusSubresource(&fluxhelmv2.HelmRelease{}).
+		Build()
+
+	r := &HelmReleaseReconciler{
+		Client:        c,
+		Scheme:        sch,
+		ArgoClient:    c,
+		Mode:          mode.InCluster,
+		ArgoNamespace: "argocd",
+	}
+
+	app := &argov1a1.Application{
+		ObjectMeta: metav1.ObjectMeta{Name: "kubedb", Namespace: "argocd"},
+		Status: argov1a1.ApplicationStatus{
+			Sync:   argov1a1.SyncStatus{Status: argov1a1.SyncStatusCodeOutOfSync},
+			Health: argov1a1.AppHealthStatus{Status: health.HealthStatusDegraded},
+			Conditions: []argov1a1.ApplicationCondition{
+				{Type: argov1a1.ApplicationConditionComparisonError, Message: "rpc error: code = Unknown desc = repo bad"},
+				{Type: argov1a1.ApplicationConditionSharedResourceWarning, Message: "Deployment/foo is part of another application"},
+			},
+		},
+	}
+
+	if err := r.updateHelmReleaseStatus(context.Background(), hr, app); err != nil {
+		t.Fatalf("updateHelmReleaseStatus: %v", err)
+	}
+
+	var post fluxhelmv2.HelmRelease
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "kubedb", Namespace: "default"}, &post); err != nil {
+		t.Fatalf("get HR: %v", err)
+	}
+
+	want := map[string]string{
+		"Ready":                 "OutOfSync",
+		"Reconciling":           "Degraded",
+		"ComparisonError":       "rpc error: code = Unknown desc = repo bad",
+		"SharedResourceWarning": "Deployment/foo is part of another application",
+	}
+	got := map[string]string{}
+	for _, c := range post.Status.Conditions {
+		got[c.Type] = c.Message
+		if c.Type == "ComparisonError" || c.Type == "SharedResourceWarning" {
+			if c.Status != metav1.ConditionTrue {
+				t.Errorf("%s status = %s, want True", c.Type, c.Status)
+			}
+			if c.Reason != c.Type {
+				t.Errorf("%s reason = %s, want %s (verbatim)", c.Type, c.Reason, c.Type)
+			}
+		}
+	}
+	for k, wantMsg := range want {
+		if k == "Ready" || k == "Reconciling" {
+			if _, ok := got[k]; !ok {
+				t.Errorf("missing %s condition; got %v", k, got)
+			}
+			continue
+		}
+		if gotMsg := got[k]; gotMsg != wantMsg {
+			t.Errorf("%s message = %q, want %q", k, gotMsg, wantMsg)
+		}
+	}
+}
+
 var _ = client.IgnoreNotFound
