@@ -1,0 +1,9 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: appscode-charts
+  namespace: flux-system
+spec:
+  type: oci
+  url: oci://ghcr.io/appscode-charts
+  interval: 1h

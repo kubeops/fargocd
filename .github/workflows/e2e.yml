@@ -1,0 +1,117 @@
+# Usage: /ok-to-test [k8s-version]
+# Examples:
+# /ok-to-test
+# /ok-to-test v1.31.0
+#
+# Security model — this workflow mirrors the pattern used in
+# stashed/stash so it behaves the same way the rest of the
+# AppsCode/Kubeops org's e2e workflows do:
+#
+#   - The `on: issue_comment` trigger runs the workflow definition that
+#     lives on the default branch, so PR code can never alter the gate.
+#   - Every job re-asserts the same `if:` gate (defence in depth).
+#   - `author_association` is set by GitHub server-side at comment time
+#     and cannot be spoofed by the comment body. Only OWNER or MEMBER
+#     of the kubeops org can authorise a run.
+#   - The actual e2e job's token is `contents: read`; no publishing
+#     secrets are exposed to PR code.
+#
+# Outsiders cannot trigger anything — the `if:` short-circuits before
+# any work runs.
+
+name: e2e
+
+on:
+  issue_comment:
+    types: [created]
+  # Allows running the workflow manually from the Actions tab.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number || github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  config:
+    if: |
+      contains(github.event.issue.html_url, '/pull/') &&
+      startsWith(github.event.comment.body, '/ok-to-test') &&
+      (github.event.comment.author_association == 'OWNER' || github.event.comment.author_association == 'MEMBER')
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        name: Generate test matrix
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          k8s=(v1.31.0)
+
+          IFS=' '
+          read -ra COMMENT <<< "$COMMENT_BODY"
+          if [ ! -z ${COMMENT[1]} ]; then
+            k8s=(${COMMENT[1]})
+          fi
+
+          matrix=()
+          for x in ${k8s[@]}; do
+            matrix+=( $( jq -n -c --arg x "$x" '{"k8s":$x}' ) )
+          done
+
+          # https://stackoverflow.com/a/63046305/244009
+          function join { local IFS="$1"; shift; echo "$*"; }
+          matrix=$(echo "{"include":[$(join , ${matrix[@]})]}")
+          echo $matrix
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  kubernetes:
+    name: Kubernetes
+    if: |
+      contains(github.event.issue.html_url, '/pull/') &&
+      startsWith(github.event.comment.body, '/ok-to-test') &&
+      (github.event.comment.author_association == 'OWNER' || github.event.comment.author_association == 'MEMBER')
+    needs: [config]
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix: ${{ fromJson(needs.config.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/merge
+
+      - name: Set up Go 1.25
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.25'
+          check-latest: true
+
+      - name: Create Kubernetes ${{ matrix.k8s }} cluster
+        id: kind
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          version: v0.31.0
+          node_image: kindest/node:${{ matrix.k8s }}
+          cluster_name: fargocd-e2e
+
+      - name: Prepare cluster for testing
+        run: |
+          echo "waiting for nodes to be ready ..."
+          kubectl wait --for=condition=Ready nodes --all --timeout=5m
+          kubectl get nodes
+          kubectl version
+
+      - name: Run e2e smoke test
+        run: ./hack/e2e-ci.sh
+
+      - name: Collect cluster diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+          kubectl get all -A
+          kubectl get helmreleases.helm.toolkit.fluxcd.io -A -o yaml
+          kubectl get applications.argoproj.io -A -o yaml
+          kubectl get events -A --sort-by=.lastTimestamp

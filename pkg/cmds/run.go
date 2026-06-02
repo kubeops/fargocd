@@ -19,10 +19,11 @@ package cmds
 import (
 	"context"
 	"crypto/tls"
-	"os"
+	"fmt"
 	"path/filepath"
 
 	"kubeops.dev/fargocd/pkg/controller"
+	"kubeops.dev/fargocd/pkg/mode"
 
 	argov1a1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	fluxhelmv2 "github.com/fluxcd/helm-controller/api/v2"
@@ -58,190 +59,212 @@ func init() {
 	utilruntime.Must(uiapi.AddToScheme(scheme))
 }
 
+// runOptions collects the user-facing flags accepted by `fargocd run`.
+type runOptions struct {
+	metricsAddr          string
+	probeAddr            string
+	enableLeaderElection bool
+	secureMetrics        bool
+	enableHTTP2          bool
+	certDir              string
+
+	mode              string
+	argoKubeconfig    string
+	argoNamespace     string
+	destinationServer string
+	destinationName   string
+	project           string
+	clusterName       string
+}
+
 func NewCmdRun() *cobra.Command {
-	metricsAddr := "0"
-	certDir := ""
-	var enableLeaderElection bool
-	probeAddr := ":8081"
-	secureMetrics := true
-	var enableHTTP2 bool
-	var tlsOpts []func(*tls.Config)
-	var argoKubeconfig string
-	argoDestinationServer := "https://kubernetes.default.svc"
-	var clusterName string
+	opts := runOptions{
+		metricsAddr:       "0",
+		probeAddr:         ":8081",
+		secureMetrics:     true,
+		mode:              string(mode.InCluster),
+		destinationServer: "https://kubernetes.default.svc",
+		project:           "default",
+	}
+
 	cmd := &cobra.Command{
 		Use:               "run",
-		Short:             "Launch FluxCD to ArgoCD bridge",
+		Short:             "Launch the FluxCD to Argo CD bridge controller",
 		DisableAutoGenTag: true,
-		Run: func(cmd *cobra.Command, args []string) {
-			ctrl.SetLogger(klog.NewKlogr())
-
-			// if the enable-http2 flag is false (the default), http/2 should be disabled
-			// due to its vulnerabilities. More specifically, disabling http/2 will
-			// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
-			// Rapid Reset CVEs. For more information see:
-			// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
-			// - https://github.com/advisories/GHSA-4374-p667-p6c8
-			disableHTTP2 := func(c *tls.Config) {
-				setupLog.Info("disabling http/2")
-				c.NextProtos = []string{"http/1.1"}
-			}
-
-			if !enableHTTP2 {
-				tlsOpts = append(tlsOpts, disableHTTP2)
-			}
-
-			// Create watchers for certificates
-			var certWatcher *certwatcher.CertWatcher
-
-			if len(certDir) > 0 {
-				setupLog.Info("Initializing certificate watcher using provided certificates",
-					"cert-dir", certDir, "cert-name", core.TLSCertKey, "cert-key", core.TLSPrivateKeyKey)
-
-				var err error
-				certWatcher, err = certwatcher.New(
-					filepath.Join(certDir, core.TLSCertKey),
-					filepath.Join(certDir, core.TLSPrivateKeyKey),
-				)
-				if err != nil {
-					setupLog.Error(err, "Failed to initialize certificate watcher")
-					os.Exit(1)
-				}
-
-				tlsOpts = append(tlsOpts, func(config *tls.Config) {
-					config.GetCertificate = certWatcher.GetCertificate
-				})
-			}
-
-			webhookServer := webhook.NewServer(webhook.Options{
-				TLSOpts: tlsOpts,
-			})
-
-			// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
-			// More info:
-			// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.20.2/pkg/metrics/server
-			// - https://book.kubebuilder.io/reference/metrics.html
-			metricsServerOptions := metricsserver.Options{
-				BindAddress:   metricsAddr,
-				SecureServing: secureMetrics,
-				TLSOpts:       tlsOpts,
-			}
-
-			if secureMetrics {
-				// FilterProvider is used to protect the metrics endpoint with authn/authz.
-				// These configurations ensure that only authorized users and service accounts
-				// can access the metrics endpoint. The RBAC are configured in 'config/rbac/kustomization.yaml'. More info:
-				// https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.20.2/pkg/metrics/filters#WithAuthenticationAndAuthorization
-				metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
-			}
-
-			mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-				Scheme:                 scheme,
-				Metrics:                metricsServerOptions,
-				WebhookServer:          webhookServer,
-				HealthProbeBindAddress: probeAddr,
-				LeaderElection:         enableLeaderElection,
-				LeaderElectionID:       "03b9a431.fargocd.appscode.com",
-				// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-				// when the Manager ends. This requires the binary to immediately end when the
-				// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-				// speeds up voluntary leader transitions as the new leader don't have to wait
-				// LeaseDuration time first.
-				//
-				// In the default scaffold provided, the program ends immediately after
-				// the manager stops, so would be fine to enable this option. However,
-				// if you are doing or is intended to do any operation such as perform cleanups
-				// after the manager stops then its usage might be unsafe.
-				// LeaderElectionReleaseOnCancel: true,
-			})
-			if err != nil {
-				setupLog.Error(err, "unable to start manager")
-				os.Exit(1)
-			}
-
-			var argoManager ctrl.Manager
-			if argoKubeconfig != "" {
-				argoConfig, err := clientcmd.BuildConfigFromFlags("", argoKubeconfig)
-				if err != nil {
-					setupLog.Error(err, "unable to build multicluster rest config")
-					os.Exit(1)
-				}
-				argoManager, err = ctrl.NewManager(argoConfig, ctrl.Options{
-					Scheme:                 scheme,
-					Metrics:                metricsserver.Options{BindAddress: "0"},
-					HealthProbeBindAddress: "0",
-					LeaderElection:         enableLeaderElection,
-					LeaderElectionID:       "03b9a432.fargocd.appscode.com",
-				})
-				if err != nil {
-					setupLog.Error(err, "unable to create mc manager")
-					os.Exit(1)
-				}
-
-				if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-					return argoManager.Start(ctx)
-				})); err != nil {
-					setupLog.Error(err, "problem running argo server manager")
-					os.Exit(1)
-				}
-			} else {
-				argoManager = mgr
-			}
-
-			if err = (&controller.HelmReleaseReconciler{
-				Client:            mgr.GetClient(),
-				Scheme:            mgr.GetScheme(),
-				ArgoClient:        argoManager.GetClient(),
-				DestinationServer: argoDestinationServer,
-				ClusterName:       clusterName,
-			}).SetupWithManager(mgr, argoManager); err != nil {
-				setupLog.Error(err, "unable to create controller", "controller", "HelmRelease")
-				os.Exit(1)
-			}
-			// +kubebuilder:scaffold:builder
-
-			if certWatcher != nil {
-				setupLog.Info("Adding certificate watcher to manager")
-				if err := mgr.Add(certWatcher); err != nil {
-					setupLog.Error(err, "unable to add certificate watcher to manager")
-					os.Exit(1)
-				}
-			}
-
-			if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-				setupLog.Error(err, "unable to set up health check")
-				os.Exit(1)
-			}
-			if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-				setupLog.Error(err, "unable to set up ready check")
-				os.Exit(1)
-			}
-
-			setupLog.Info("starting manager")
-			if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-				setupLog.Error(err, "problem running manager")
-				os.Exit(1)
-			}
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runOperator(opts)
 		},
 	}
 
-	cmd.Flags().StringVar(&metricsAddr, "metrics-bind-address", metricsAddr, "The address the metrics endpoint binds to. "+
-		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
-	cmd.Flags().StringVar(&probeAddr, "health-probe-bind-address", probeAddr, "The address the probe endpoint binds to.")
-	cmd.Flags().BoolVar(&enableLeaderElection, "leader-elect", enableLeaderElection,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
-	cmd.Flags().BoolVar(&secureMetrics, "metrics-secure", secureMetrics,
-		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
-	cmd.Flags().StringVar(&certDir, "cert-dir", "",
-		"The directory that contains the webhook and metrics server certificate.")
-	cmd.Flags().BoolVar(&enableHTTP2, "enable-http2", enableHTTP2,
-		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	cmd.Flags().StringVar(&argoKubeconfig, "argo-kubeconfig", argoKubeconfig,
-		"The path to argo server kubeconfig")
-	cmd.Flags().StringVar(&argoDestinationServer, "argo-dest-server", argoDestinationServer,
-		"Destination server for argo server")
-	cmd.Flags().StringVar(&clusterName, "cluster-name", clusterName,
-		"Spoke cluster name")
+	cmd.Flags().StringVar(&opts.metricsAddr, "metrics-bind-address", opts.metricsAddr,
+		"The address the metrics endpoint binds to. Use :8443 for HTTPS, :8080 for HTTP, or 0 to disable.")
+	cmd.Flags().StringVar(&opts.probeAddr, "health-probe-bind-address", opts.probeAddr,
+		"The address the probe endpoint binds to.")
+	cmd.Flags().BoolVar(&opts.enableLeaderElection, "leader-elect", opts.enableLeaderElection,
+		"Enable leader election so only one fargocd instance is active at a time.")
+	cmd.Flags().BoolVar(&opts.secureMetrics, "metrics-secure", opts.secureMetrics,
+		"Serve the metrics endpoint over HTTPS.")
+	cmd.Flags().StringVar(&opts.certDir, "cert-dir", opts.certDir,
+		"Directory containing the webhook/metrics server certificate.")
+	cmd.Flags().BoolVar(&opts.enableHTTP2, "enable-http2", opts.enableHTTP2,
+		"Enable HTTP/2 for the metrics and webhook servers (disabled by default; see GHSA-qppj-fm5r-hxr3).")
+
+	cmd.Flags().StringVar(&opts.mode, "mode", opts.mode,
+		"How fargocd talks to Argo CD: 'in-cluster', 'autonomous', or 'managed'.")
+	cmd.Flags().StringVar(&opts.argoKubeconfig, "argo-kubeconfig", opts.argoKubeconfig,
+		"Path to a kubeconfig for the Argo CD principal cluster (required in managed mode).")
+	cmd.Flags().StringVar(&opts.argoNamespace, "argo-namespace", opts.argoNamespace,
+		"Namespace on the Argo CD cluster where Applications are written. Auto-discovered when empty.")
+	cmd.Flags().StringVar(&opts.destinationServer, "argo-dest-server", opts.destinationServer,
+		"Application.spec.destination.server. Defaults to the in-cluster API server.")
+	cmd.Flags().StringVar(&opts.destinationName, "argo-dest-name", opts.destinationName,
+		"Application.spec.destination.name. Useful in managed mode to reference a cluster by symbolic name.")
+	cmd.Flags().StringVar(&opts.project, "argo-project", opts.project,
+		"Argo CD Project assigned to generated Applications.")
+	cmd.Flags().StringVar(&opts.clusterName, "cluster-name", opts.clusterName,
+		"Symbolic name of the workload cluster. Required in managed mode; suffixes Application names to avoid collisions when one principal serves many clusters.")
 	return cmd
+}
+
+// runOperator wires up the manager(s) and starts the reconciler.
+func runOperator(opts runOptions) error {
+	ctrl.SetLogger(klog.NewKlogr())
+
+	mode, err := mode.Parse(opts.mode)
+	if err != nil {
+		setupLog.Error(err, "invalid mode")
+		return err
+	}
+	if mode.RemotePrincipal() {
+		if opts.argoKubeconfig == "" {
+			return fmt.Errorf("--argo-kubeconfig is required when --mode=managed")
+		}
+		if opts.clusterName == "" {
+			return fmt.Errorf("--cluster-name is required when --mode=managed")
+		}
+	}
+
+	// http/2 is disabled by default; see GHSA-qppj-fm5r-hxr3 / GHSA-4374-p667-p6c8.
+	var tlsOpts []func(*tls.Config)
+	if !opts.enableHTTP2 {
+		tlsOpts = append(tlsOpts, func(c *tls.Config) {
+			setupLog.Info("disabling http/2")
+			c.NextProtos = []string{"http/1.1"}
+		})
+	}
+
+	var certWatcher *certwatcher.CertWatcher
+	if opts.certDir != "" {
+		setupLog.Info("initializing certificate watcher",
+			"cert-dir", opts.certDir, "cert-name", core.TLSCertKey, "cert-key", core.TLSPrivateKeyKey)
+		var err error
+		certWatcher, err = certwatcher.New(
+			filepath.Join(opts.certDir, core.TLSCertKey),
+			filepath.Join(opts.certDir, core.TLSPrivateKeyKey),
+		)
+		if err != nil {
+			setupLog.Error(err, "failed to initialize certificate watcher")
+			return err
+		}
+		tlsOpts = append(tlsOpts, func(config *tls.Config) {
+			config.GetCertificate = certWatcher.GetCertificate
+		})
+	}
+
+	webhookServer := webhook.NewServer(webhook.Options{TLSOpts: tlsOpts})
+
+	metricsServerOptions := metricsserver.Options{
+		BindAddress:   opts.metricsAddr,
+		SecureServing: opts.secureMetrics,
+		TLSOpts:       tlsOpts,
+	}
+	if opts.secureMetrics {
+		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
+	}
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                metricsServerOptions,
+		WebhookServer:          webhookServer,
+		HealthProbeBindAddress: opts.probeAddr,
+		LeaderElection:         opts.enableLeaderElection,
+		LeaderElectionID:       "03b9a431.fargocd.appscode.com",
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to start manager")
+		return err
+	}
+
+	argoManager, err := buildArgoManager(opts, mgr)
+	if err != nil {
+		setupLog.Error(err, "unable to start Argo CD cluster manager")
+		return err
+	}
+
+	reconciler := &controller.HelmReleaseReconciler{
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		ArgoClient:        argoManager.GetClient(),
+		Mode:              mode,
+		ArgoNamespace:     opts.argoNamespace,
+		DestinationServer: opts.destinationServer,
+		DestinationName:   opts.destinationName,
+		Project:           opts.project,
+		ClusterName:       opts.clusterName,
+	}
+	if err := reconciler.SetupWithManager(mgr, argoManager); err != nil {
+		setupLog.Error(err, "unable to set up controller", "controller", "HelmRelease")
+		return err
+	}
+
+	if certWatcher != nil {
+		if err := mgr.Add(certWatcher); err != nil {
+			setupLog.Error(err, "unable to add certificate watcher to manager")
+			return err
+		}
+	}
+
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		return err
+	}
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		return err
+	}
+
+	setupLog.Info("starting manager", "mode", mode)
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		setupLog.Error(err, "problem running manager")
+		return err
+	}
+	return nil
+}
+
+// buildArgoManager returns the manager that owns the connection to the Argo
+// CD cluster. When --argo-kubeconfig is set, it manages a remote cluster;
+// otherwise it just reuses the local manager.
+func buildArgoManager(opts runOptions, mgr ctrl.Manager) (ctrl.Manager, error) {
+	if opts.argoKubeconfig == "" {
+		return mgr, nil
+	}
+
+	argoConfig, err := clientcmd.BuildConfigFromFlags("", opts.argoKubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("build Argo CD rest config: %w", err)
+	}
+	argoMgr, err := ctrl.NewManager(argoConfig, ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+		LeaderElection:         opts.enableLeaderElection,
+		LeaderElectionID:       "03b9a432.fargocd.appscode.com",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create Argo CD manager: %w", err)
+	}
+	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		return argoMgr.Start(ctx)
+	})); err != nil {
+		return nil, fmt.Errorf("add Argo CD manager: %w", err)
+	}
+	return argoMgr, nil
 }

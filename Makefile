@@ -376,7 +376,7 @@ check-license:
 		ltag -t "./hack/license" --excludes "vendor contrib bin" --check -v
 
 .PHONY: ci
-ci: verify check-license lint build # unit-tests cover
+ci: verify check-license lint build unit-tests
 
 .PHONY: qa
 qa:
