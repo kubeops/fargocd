@@ -17,8 +17,9 @@ limitations under the License.
 package manager
 
 import (
-	"github.com/spf13/pflag"
 	"kubeops.dev/fargocd/pkg/mode"
+
+	"github.com/spf13/pflag"
 )
 
 // ManagerOptions are the hub-side flags that configure how each spoke
