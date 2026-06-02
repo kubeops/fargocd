@@ -17,6 +17,8 @@ limitations under the License.
 package cmds
 
 import (
+	"kubeops.dev/fargocd/pkg/manager"
+
 	"github.com/spf13/cobra"
 	v "gomodules.xyz/x/version"
 )
@@ -29,6 +31,7 @@ func NewRootCmd() *cobra.Command {
 	}
 
 	rootCmd.AddCommand(NewCmdRun())
+	rootCmd.AddCommand(manager.NewManagerCommand())
 	rootCmd.AddCommand(v.NewCmdVersion())
 	rootCmd.AddCommand(NewCmdCompletion())
 
