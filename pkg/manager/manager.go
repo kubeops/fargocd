@@ -23,9 +23,6 @@ package manager
 import (
 	"context"
 	"embed"
-	"errors"
-	"net/http"
-	"time"
 
 	"github.com/spf13/cobra"
 	"k8s.io/client-go/rest"
@@ -61,10 +58,6 @@ func runManagerController(ctx context.Context, cfg *rest.Config, opts *ManagerOp
 		return errs[0]
 	}
 
-	if opts.ProbeAddr != "" {
-		startProbeServer(ctx, opts.ProbeAddr)
-	}
-
 	getValues, err := GetConfigValues(opts)
 	if err != nil {
 		return err
@@ -91,36 +84,4 @@ func runManagerController(ctx context.Context, cfg *rest.Config, opts *ManagerOp
 		return err
 	}
 	return addonManager.Start(ctx)
-}
-
-// startProbeServer spins up a plain-HTTP server that returns 200 OK
-// for /healthz and /readyz. It's a process-liveness signal for kubelet
-// probes — the addon-framework's HTTPS server on :8443 uses a runtime
-// self-signed cert that's awkward to probe through, so we serve a
-// dedicated plain-HTTP listener here.
-func startProbeServer(ctx context.Context, addr string) {
-	mux := http.NewServeMux()
-	ok := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
-	mux.HandleFunc("/healthz", ok)
-	mux.HandleFunc("/readyz", ok)
-
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	go func() {
-		klog.Infof("starting health probe server on %s", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			klog.Errorf("probe server error: %v", err)
-		}
-	}()
-
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
 }
