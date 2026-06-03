@@ -14,10 +14,6 @@ metadata:
 {{- end }}
 spec:
   ports:
-  - name: https
-    port: 443
-    protocol: TCP
-    targetPort: https
   - name: metrics
     port: 8443
     protocol: TCP

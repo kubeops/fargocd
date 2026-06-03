@@ -45,6 +45,12 @@ type ManagerOptions struct {
 	// spoke whose data key `kubeconfig` holds the principal kubeconfig.
 	// Mutually exclusive with ArgoKubeconfigFile.
 	ArgoKubeconfigSecret string
+
+	// ProbeAddr is the listen address for the plain-HTTP probe server
+	// that exposes /healthz and /readyz for kubelet probes. Separate
+	// from the addon-framework's HTTPS server on :8443 so probes don't
+	// need to navigate the self-signed serving cert.
+	ProbeAddr string
 }
 
 func NewManagerOptions() *ManagerOptions {
@@ -52,6 +58,7 @@ func NewManagerOptions() *ManagerOptions {
 		Mode:              string(mode.InCluster),
 		DestinationServer: "https://kubernetes.default.svc",
 		Project:           "default",
+		ProbeAddr:         ":8081",
 	}
 }
 
@@ -64,6 +71,7 @@ func (s *ManagerOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&s.Project, "argo-project", s.Project, "Argo CD Project assigned to generated Applications.")
 	fs.StringVar(&s.ArgoKubeconfigFile, "argo-kubeconfig-file", s.ArgoKubeconfigFile, "Path to a kubeconfig for the Argo CD principal cluster, propagated to every spoke (managed mode).")
 	fs.StringVar(&s.ArgoKubeconfigSecret, "argo-kubeconfig-secret", s.ArgoKubeconfigSecret, "Name of an existing Secret on each spoke holding the principal kubeconfig (managed mode; alternative to --argo-kubeconfig-file).")
+	fs.StringVar(&s.ProbeAddr, "health-probe-bind-address", s.ProbeAddr, "Address the plain-HTTP /healthz and /readyz endpoints bind to. Set to an empty string to disable.")
 }
 
 func (s *ManagerOptions) Validate() []error {
