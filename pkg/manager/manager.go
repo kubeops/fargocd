@@ -83,5 +83,12 @@ func runManagerController(ctx context.Context, cfg *rest.Config, opts *ManagerOp
 	if err := addonManager.AddAgent(agentAddon); err != nil {
 		return err
 	}
-	return addonManager.Start(ctx)
+	if err := addonManager.Start(ctx); err != nil {
+		return err
+	}
+	// addonManager.Start only launches the informers in background
+	// goroutines and returns immediately; block until the context is
+	// cancelled (e.g. SIGTERM) so the manager keeps running.
+	<-ctx.Done()
+	return nil
 }
