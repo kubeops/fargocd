@@ -56,6 +56,12 @@ type RegistryProxies struct {
 	// r.appscode.com
 	//+optional
 	AppsCode string `json:"appscode"`
+	// container-registry.oracle.com
+	//+optional
+	Oracle string `json:"oracle"`
+	// cr.weaviate.io
+	//+optional
+	Weaviate string `json:"weaviate"`
 }
 
 type RegistryInfo struct {

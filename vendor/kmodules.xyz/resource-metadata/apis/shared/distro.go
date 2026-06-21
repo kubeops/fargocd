@@ -14,14 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package v1alpha1
+package shared
 
-import (
-	"x-helm.dev/apimachinery/crds"
+// +kubebuilder:validation:Enum=all;catalog;operator
+type UBIMode string
 
-	"kmodules.xyz/client-go/apiextensions"
-)
-
-func (Order) CustomResourceDefinition() *apiextensions.CustomResourceDefinition {
-	return crds.MustCustomResourceDefinition(GroupVersion.WithResource(ResourceOrders))
+type DistroSpec struct {
+	Openshift bool    `json:"openshift"`
+	UBI       UBIMode `json:"ubi"`
 }
