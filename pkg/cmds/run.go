@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"kubeops.dev/fargocd/pkg/controller"
 	"kubeops.dev/fargocd/pkg/mode"
@@ -30,10 +31,15 @@ import (
 	fluxsrcv1 "github.com/fluxcd/source-controller/api/v1"
 	"github.com/spf13/cobra"
 	core "k8s.io/api/core/v1"
+	kerr "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	uiapi "kmodules.xyz/resource-metadata/apis/ui/v1alpha1"
@@ -79,12 +85,13 @@ type runOptions struct {
 
 func NewCmdRun() *cobra.Command {
 	opts := runOptions{
-		metricsAddr:       "0",
-		probeAddr:         ":8081",
-		secureMetrics:     true,
-		mode:              string(mode.InCluster),
-		destinationServer: "https://kubernetes.default.svc",
-		project:           "default",
+		metricsAddr:   "0",
+		probeAddr:     ":8081",
+		secureMetrics: true,
+		mode:          string(mode.InCluster),
+		// No default: the controller falls back when both dest fields are
+		// empty, and Helm's `with` can't clear a non-empty default.
+		project: "default",
 	}
 
 	cmd := &cobra.Command{
@@ -129,13 +136,14 @@ func NewCmdRun() *cobra.Command {
 // runOperator wires up the manager(s) and starts the reconciler.
 func runOperator(opts runOptions) error {
 	ctrl.SetLogger(klog.NewKlogr())
+	ctx := ctrl.SetupSignalHandler()
 
-	mode, err := mode.Parse(opts.mode)
+	agentMode, err := mode.Parse(opts.mode)
 	if err != nil {
 		setupLog.Error(err, "invalid mode")
 		return err
 	}
-	if mode.RemotePrincipal() {
+	if agentMode.RemotePrincipal() {
 		if opts.argoKubeconfig == "" {
 			return fmt.Errorf("--argo-kubeconfig is required when --mode=managed")
 		}
@@ -201,11 +209,20 @@ func runOperator(opts runOptions) error {
 		return err
 	}
 
+	// Only autonomous mode bundles the Application CRD, so only there can
+	// a fresh spoke race its registration against this process's watch.
+	if agentMode == mode.Autonomous {
+		if err := waitForApplicationCRD(ctx, argoManager.GetConfig()); err != nil {
+			setupLog.Error(err, "Application CRD did not become available")
+			return err
+		}
+	}
+
 	reconciler := &controller.HelmReleaseReconciler{
 		Client:            mgr.GetClient(),
 		Scheme:            mgr.GetScheme(),
 		ArgoClient:        argoManager.GetClient(),
-		Mode:              mode,
+		Mode:              agentMode,
 		ArgoNamespace:     opts.argoNamespace,
 		DestinationServer: opts.destinationServer,
 		DestinationName:   opts.destinationName,
@@ -231,17 +248,66 @@ func runOperator(opts runOptions) error {
 		return err
 	}
 
-	setupLog.Info("starting manager", "mode", mode)
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	setupLog.Info("starting manager", "mode", agentMode)
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		return err
 	}
 	return nil
 }
 
-// buildArgoManager returns the manager that owns the connection to the Argo
-// CD cluster. When --argo-kubeconfig is set, it manages a remote cluster;
-// otherwise it just reuses the local manager.
+// waitForApplicationCRD blocks up to 2 minutes for the CRD to become
+// discoverable, so a fresh spoke converges instead of crashlooping.
+func waitForApplicationCRD(ctx context.Context, cfg *rest.Config) error {
+	disco, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("build discovery client: %w", err)
+	}
+
+	const gv = "argoproj.io/v1alpha1"
+	logged := false
+	pollErr := wait.PollUntilContextTimeout(ctx, 5*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		resources, err := disco.ServerResourcesForGroupVersion(gv)
+		if kerr.IsNotFound(err) {
+			if !logged {
+				setupLog.Info("waiting for Application CRD to become available", "groupVersion", gv)
+				logged = true
+			}
+			return false, nil
+		}
+		if err != nil {
+			// Not a "CRD not registered yet" case -- fail fast.
+			return false, fmt.Errorf("discovery failed for %s: %w", gv, err)
+		}
+		if !hasResource(resources, "applications") {
+			if !logged {
+				setupLog.Info("waiting for Application CRD to become available", "groupVersion", gv)
+				logged = true
+			}
+			return false, nil
+		}
+		return true, nil
+	})
+	if pollErr != nil {
+		return fmt.Errorf("wait for Application CRD (%s): %w", gv, pollErr)
+	}
+	return nil
+}
+
+func hasResource(list *metav1.APIResourceList, name string) bool {
+	if list == nil {
+		return false
+	}
+	for _, r := range list.APIResources {
+		if r.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// buildArgoManager owns the Argo CD connection: a remote manager when
+// --argo-kubeconfig is set, otherwise the local manager.
 func buildArgoManager(opts runOptions, mgr ctrl.Manager) (ctrl.Manager, error) {
 	if opts.argoKubeconfig == "" {
 		return mgr, nil

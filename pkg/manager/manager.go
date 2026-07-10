@@ -14,10 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package manager exposes the OCM AddOn manager subcommand. It runs on
-// an Open Cluster Management hub and uses the addon-framework Helm
-// agent factory to ship the embedded fargocd installer chart to every
-// selected ManagedCluster (spoke).
+// Package manager exposes the OCM AddOn manager subcommand, which ships
+// the embedded fargocd chart to every selected ManagedCluster (spoke).
 package manager
 
 import (
@@ -25,12 +23,14 @@ import (
 	"embed"
 
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/component-base/version"
 	"k8s.io/klog/v2"
 	"open-cluster-management.io/addon-framework/pkg/addonfactory"
 	"open-cluster-management.io/addon-framework/pkg/addonmanager"
 	cmdfactory "open-cluster-management.io/addon-framework/pkg/cmd/factory"
+	"open-cluster-management.io/addon-framework/pkg/utils"
 	addonv1alpha1 "open-cluster-management.io/api/addon/v1alpha1"
 )
 
@@ -74,6 +74,11 @@ func runManagerController(ctx context.Context, cfg *rest.Config, opts *ManagerOp
 		WithAgentInstallNamespace(func(addon *addonv1alpha1.ManagedClusterAddOn) (string, error) {
 			return AddonInstallationNamespace, nil
 		}).
+		// Without this, addon-framework expects a Lease this agent never
+		// creates and status stays stuck at Unknown.
+		WithAgentHealthProber(utils.NewDeploymentProber(
+			types.NamespacedName{Namespace: AddonInstallationNamespace, Name: AgentName},
+		)).
 		BuildHelmAgentAddon()
 	if err != nil {
 		klog.Errorf("build fargocd agent addon: %v", err)
@@ -86,9 +91,7 @@ func runManagerController(ctx context.Context, cfg *rest.Config, opts *ManagerOp
 	if err := addonManager.Start(ctx); err != nil {
 		return err
 	}
-	// addonManager.Start only launches the informers in background
-	// goroutines and returns immediately; block until the context is
-	// cancelled (e.g. SIGTERM) so the manager keeps running.
+	// Start returns immediately; block until context cancellation.
 	<-ctx.Done()
 	return nil
 }

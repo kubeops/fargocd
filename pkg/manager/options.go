@@ -22,10 +22,8 @@ import (
 	"github.com/spf13/pflag"
 )
 
-// ManagerOptions are the hub-side flags that configure how each spoke
-// is rendered. They map onto the corresponding `argocd.*` keys in the
-// fargocd installer chart's values.yaml. Values left empty fall through
-// to the chart defaults.
+// ManagerOptions are the hub-side flags controlling how each spoke is
+// rendered; map onto `argocd.*` chart values, falling through when empty.
 type ManagerOptions struct {
 	RegistryFQDN string
 
@@ -35,23 +33,20 @@ type ManagerOptions struct {
 	DestinationName   string
 	Project           string
 
-	// ArgoKubeconfigFile is a path on the manager pod whose contents
-	// hold a kubeconfig for the Argo CD principal cluster. When set, it
-	// is propagated to every spoke as the chart's argocd.kubeconfig
-	// value (the chart materializes a Secret from it). Required when
+	// Propagated to every spoke as argocd.kubeconfig. Required when
 	// Mode=managed and ArgoKubeconfigSecret is empty.
 	ArgoKubeconfigFile string
-	// ArgoKubeconfigSecret is the name of a pre-created Secret on each
-	// spoke whose data key `kubeconfig` holds the principal kubeconfig.
-	// Mutually exclusive with ArgoKubeconfigFile.
+	// Pre-created per-spoke Secret holding the principal kubeconfig;
+	// mutually exclusive with ArgoKubeconfigFile.
 	ArgoKubeconfigSecret string
 }
 
 func NewManagerOptions() *ManagerOptions {
 	return &ManagerOptions{
-		Mode:              string(mode.InCluster),
-		DestinationServer: "https://kubernetes.default.svc",
-		Project:           "default",
+		// Preserves pre-existing behavior across binary upgrades.
+		Mode: string(mode.InCluster),
+		// No default: see run.go's runOptions for why.
+		Project: "default",
 	}
 }
 

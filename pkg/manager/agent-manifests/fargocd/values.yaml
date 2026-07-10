@@ -128,8 +128,9 @@ argocd:
   # Auto-discovered when empty (uses the namespace of the Service labelled
   # app.kubernetes.io/name=argocd-server).
   namespace: ""
-  # Application.spec.destination.server. Defaults to the in-cluster API server.
-  destServer: "https://kubernetes.default.svc"
+  # Left empty; controller falls back to the in-cluster server when both
+  # this and destName are empty. Must stay empty when destName is set.
+  destServer: ""
   # Application.spec.destination.name. Set when Argo CD references the
   # workload cluster by symbolic name (typical in managed mode).
   destName: ""

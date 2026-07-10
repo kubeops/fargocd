@@ -74,7 +74,9 @@ For a given `HelmRelease`:
    empty string rather than `"{}\n"` so Argo CD honours chart defaults.
 8. **Detect ignoreDifferences** — render the chart twice and diff (see
    below). Failures are logged but do not block reconciliation, so a
-   transient registry hiccup will not stall sync.
+   transient registry hiccup will not stall sync. As part of this step any
+   chart-shipped CRD too large for client-side apply is created directly on
+   the HelmRelease cluster if missing (see "Oversized CRDs" below).
 9. **Create-or-patch Application** — using `controllerutil.CreateOrPatch`,
    with the `fargocd.appscode.com/helmrelease` annotation backlinking the
    originating HelmRelease and, in managed mode, the
@@ -103,11 +105,39 @@ For a given `HelmRelease`:
 | `managed` | Remote principal (`--argo-kubeconfig`) | Per-cluster namespace on the principal | Symbolic name (`--argo-dest-name`) |
 
 For `autonomous` mode the topology looks identical to `in-cluster` because
-the Application lives next to the workload — the difference is that
-`argocd-agent` (rather than a standalone Argo CD) reconciles it and pushes
-status back to the principal. The mode is still surfaced as a flag so the
-operator can label/annotate appropriately and so the README/docs can be
-generated correctly.
+the Application lives next to the workload — the difference is that a
+headless Argo CD reconciles it locally and (optionally) `argocd-agent`
+mirrors it up to a principal on the hub for observability. The mode is
+still surfaced as a flag so the operator can label/annotate appropriately
+and so the README/docs can be generated correctly.
+
+### Headless Argo CD (Argo CD Core) is installed by b3, not this chart
+
+Autonomous spokes still need a local, headless Argo CD (**Argo CD Core**:
+application-controller, repo-server, redis; no argocd-server/UI, no dex, no
+notifications) to reconcile the Applications fargocd creates. Earlier
+revisions of the fargocd-manager OCM addon chart vendored and shipped Argo
+CD Core itself via ManifestWork (`argocd.deploy` chart value /
+`--deploy-argocd` hub-manager flag). That mechanism has been **removed**:
+the backend (`b3`, see
+`routers/api/v1/cluster/importer/workload_argocd.go`,
+`installArgoCDAgentWorkloadStack`) now installs the same headless Argo CD
+directly on the spoke via its own Helm SDK release, as part of the same
+flow that installs the `argocd-agent` agent. Having both fargocd-manager
+(via OCM ManifestWork) and b3 (via a direct Helm release) independently
+manage the same `argocd`/`argocd-application-controller` resources on one
+spoke would race, so only one owner remains.
+
+fargocd's own `--mode`/`argocd.mode` flag and the `argocd.namespace` /
+`argocd.destServer` / `argocd.destName` / `argocd.project` /
+`argocd.clusterName` / `argocd.kubeconfig*` chart values are unaffected —
+they configure how the fargocd controller talks to Argo CD regardless of
+who installed it. When `mode=autonomous`, the chart simply assumes a headless Argo CD already
+exists on the spoke (installed by b3). Note that namespace
+auto-discovery (§ Reconcile loop, step 2) looks for a Service labelled
+`app.kubernetes.io/name=argocd-server` — a headless Argo CD Core has no
+such Service — so autonomous-mode deployments must set `argocd.namespace`
+explicitly to match wherever b3 installs Argo CD Core.
 
 ### Multi-cluster naming
 
@@ -152,6 +182,35 @@ SDK (we explicitly avoid shelling out to the `helm` CLI):
 
 The package exposes `DetectFn` so unit tests can stub the helm pipeline
 without needing network access.
+
+### Oversized CRDs
+
+Some charts ship CRDs whose documents are so large (kube-prometheus-stack's
+`prometheuses` CRD, for example) that kubectl-style client-side apply cannot
+write them at all: the apply records the whole object in the
+`kubectl.kubernetes.io/last-applied-configuration` annotation, and the API
+server caps `metadata.annotations` at 256 KiB. Argo CD's default apply is
+client-side, so it can neither create nor update these CRDs.
+
+Turning on `ServerSideApply=true` for the Application is deliberately NOT
+the fix. SSA submits the rendered manifests verbatim, and the API server
+then rejects chart output that Helm's client-side path quietly launders —
+most commonly an explicit `null` where the schema expects an array (
+kube-prometheus-stack renders `PrometheusRule` groups with `rules: null`
+when all rules in a group are disabled via values). A HelmRelease that
+works under the FluxCD helm-controller must keep working under fargocd, so
+the Application stays on client-side apply.
+
+Instead, fargocd handles the one thing client-side apply cannot do:
+`ensureOversizedCRDs` creates any missing oversized CRD directly on the
+HelmRelease cluster with a plain, annotation-free create. That cluster is
+the Application's destination in every agent mode (in managed mode only the
+Application *object* lives on the remote principal), so the CRD always
+lands on the right cluster. From then on the generated `ignoreDifferences`
+rules plus `ApplyOutOfSyncOnly=true` keep every sync away from the CRD —
+Helm's install-once contract for `crds/`. Existing CRDs are never patched,
+by fargocd or by Argo CD. This requires `create` on
+`customresourcedefinitions` in fargocd's ClusterRole.
 
 ### Why diff renders instead of hard-coding rules?
 

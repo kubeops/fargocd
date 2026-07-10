@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -61,63 +62,300 @@ type RegistryCredentials struct {
 
 // Cache key for memoizing results
 type cacheKey struct {
-	Chart   string
-	Version string
-	RepoURL string
-	NS      string
+	Chart       string
+	Version     string
+	RepoURL     string
+	NS          string
+	ReleaseName string
+}
+
+// Result is chart analysis's output: unconditionally-safe ignoreDifferences
+// rules, plus crds/ CRD names (reported, not ruled -- ownership is the caller's call).
+type Result struct {
+	Rules []argov1a1.ResourceIgnoreDifferences
+	// HelmCRDs lists the names of CustomResourceDefinitions shipped in the
+	// chart's crds/ directory (including subcharts').
+	HelmCRDs []string
+	// OversizedHelmCRDs is the subset of HelmCRDs too large for client-side
+	// apply to ever patch (exceeds the 256KiB last-applied-config annotation cap).
+	OversizedHelmCRDs []string
+	// OversizedHelmCRDDocs maps each OversizedHelmCRDs name to its raw
+	// manifest, for a caller to create directly (client-side apply can't even create these).
+	OversizedHelmCRDDocs map[string]string
+	// Objects lets callers cross-check rendered specs against the live CRD
+	// schema, since undeclared fields get pruned under lenient apply.
+	Objects []RenderedObject
+}
+
+// RenderedObject is a rendered resource's identity plus its spec.
+type RenderedObject struct {
+	Group     string
+	Version   string
+	Kind      string
+	Name      string
+	Namespace string
+	Spec      map[string]any
 }
 
 var (
 	mu    sync.RWMutex
-	cache = make(map[cacheKey][]argov1a1.ResourceIgnoreDifferences)
+	cache = make(map[cacheKey]Result)
 )
 
-// DetectFn is the function used to render the chart and compute
-// ignoreDifferences. It exists as a package variable so tests can stub the
-// helm-pull/render pipeline (which would otherwise need network access).
-//
-// Set this variable in test setup with t.Cleanup to restore the default.
+// DetectFn is a package variable so tests can stub the helm-pull/render
+// pipeline (network access) via t.Cleanup, instead of hitting it for real.
 var DetectFn = detectIgnoreDifferences
 
-// DetectIgnoreDifferences renders a chart twice and returns ignoreDifferences
-// for fields that change between renders. Result are memoised per (chart,
-// version, repoURL, namespace).
-func DetectIgnoreDifferences(ctx context.Context, chartName, chartVersion, repoURL, namespace string, values map[string]any, creds *RegistryCredentials) ([]argov1a1.ResourceIgnoreDifferences, error) {
-	return DetectFn(ctx, chartName, chartVersion, repoURL, namespace, values, creds)
+// DetectIgnoreDifferences renders a chart twice, diffs what changed, and
+// memoises the Result per (chart, version, repoURL, namespace, releaseName).
+func DetectIgnoreDifferences(ctx context.Context, chartName, chartVersion, repoURL, namespace, releaseName string, values map[string]any, creds *RegistryCredentials) (Result, error) {
+	return DetectFn(ctx, chartName, chartVersion, repoURL, namespace, releaseName, values, creds)
 }
 
-func detectIgnoreDifferences(ctx context.Context, chartName, chartVersion, repoURL, namespace string, values map[string]any, creds *RegistryCredentials) ([]argov1a1.ResourceIgnoreDifferences, error) {
-	key := cacheKey{chartName, chartVersion, repoURL, namespace}
+func detectIgnoreDifferences(ctx context.Context, chartName, chartVersion, repoURL, namespace, releaseName string, values map[string]any, creds *RegistryCredentials) (Result, error) {
+	key := cacheKey{chartName, chartVersion, repoURL, namespace, releaseName}
 
 	mu.RLock()
-	if rules, ok := cache[key]; ok {
+	if res, ok := cache[key]; ok {
 		mu.RUnlock()
-		return rules, nil
+		return res, nil
 	}
 	mu.RUnlock()
 
 	// Render chart twice
 	var manifests []string
+	var crdManifest string
 	for i := 0; i < 2; i++ {
-		m, err := renderChart(ctx, chartName, chartVersion, repoURL, namespace, values, creds)
+		m, crds, err := renderChart(ctx, chartName, chartVersion, repoURL, namespace, releaseName, values, creds)
 		if err != nil {
-			return nil, fmt.Errorf("render %d: %w", i+1, err)
+			return Result{}, fmt.Errorf("render %d: %w", i+1, err)
 		}
 		manifests = append(manifests, m)
+		crdManifest = crds
 	}
 
 	// Find differences
 	rules := findIgnoreDifferences(manifests)
+	rules = append(rules, detectForeignChartResources(manifests[0], chartName, chartVersion, releaseName)...)
+	rules = append(rules, nullFieldRules(manifests[0])...)
+
+	helmCRDs, oversizedCRDs, oversizedDocs := helmCRDNames(crdManifest)
+	res := Result{
+		Rules:                dedupeRules(rules),
+		HelmCRDs:             helmCRDs,
+		OversizedHelmCRDs:    oversizedCRDs,
+		OversizedHelmCRDDocs: oversizedDocs,
+		Objects:              renderedObjects(manifests[0]),
+	}
 
 	// Cache result
 	mu.Lock()
-	cache[key] = rules
+	cache[key] = res
 	mu.Unlock()
 
-	return rules, nil
+	return res, nil
 }
 
-func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespace string, values map[string]any, creds *RegistryCredentials) (string, error) {
+// detectForeignChartResources finds resources whose helm.sh/chart or
+// app.kubernetes.io/instance labels don't match this release -- a vendored resource the double-render diff alone can't catch.
+func detectForeignChartResources(manifest, chartName, chartVersion, releaseName string) []argov1a1.ResourceIgnoreDifferences {
+	expectedChart := chartName + "-" + chartVersion
+
+	var rules []argov1a1.ResourceIgnoreDifferences
+	for _, res := range parseResources(manifest) {
+		labels, _ := res.Metadata["labels"].(map[string]any)
+		if labels == nil {
+			continue
+		}
+
+		chartLabel, _ := labels["helm.sh/chart"].(string)
+		instanceLabel, _ := labels["app.kubernetes.io/instance"].(string)
+
+		chartMismatch := chartLabel != "" && chartLabel != expectedChart
+		instanceMismatch := instanceLabel != "" && releaseName != "" && instanceLabel != releaseName
+		if !chartMismatch && !instanceMismatch {
+			continue
+		}
+
+		rules = append(rules, argov1a1.ResourceIgnoreDifferences{
+			Group:        res.Group,
+			Kind:         res.Kind,
+			Name:         res.Name,
+			Namespace:    res.Namespace,
+			JSONPointers: []string{"/spec", "/metadata/labels", "/metadata/annotations"},
+		})
+	}
+	return rules
+}
+
+// oversizedCRDBytes stays comfortably under the API server's 256KiB
+// metadata.annotations cap that client-side apply's own annotation hits.
+const oversizedCRDBytes = 200 * 1024
+
+// helmCRDNames returns CRD names from crdManifest (the chart's crds/
+// content), plus the oversized subset (see oversizedCRDBytes) and their raw docs.
+func helmCRDNames(crdManifest string) (names, oversized []string, oversizedDocs map[string]string) {
+	if strings.TrimSpace(crdManifest) == "" {
+		return nil, nil, nil
+	}
+
+	for _, doc := range yamlDocSeparator.Split(crdManifest, -1) {
+		doc = strings.TrimSpace(doc)
+		if doc == "" {
+			continue
+		}
+		res := parseResources(doc)
+		for _, r := range res {
+			if r.Kind != "CustomResourceDefinition" {
+				continue
+			}
+			names = append(names, r.Name)
+			if len(doc) > oversizedCRDBytes {
+				oversized = append(oversized, r.Name)
+				if oversizedDocs == nil {
+					oversizedDocs = make(map[string]string)
+				}
+				oversizedDocs[r.Name] = doc
+			}
+		}
+	}
+	sort.Strings(names)
+	sort.Strings(oversized)
+	return names, oversized, oversizedDocs
+}
+
+// nullFieldRules ignores explicit-null fields: they never survive a write
+// (pruned server-side, dropped by typed controllers' omitempty), so they'd diff forever otherwise.
+func nullFieldRules(manifest string) []argov1a1.ResourceIgnoreDifferences {
+	var rules []argov1a1.ResourceIgnoreDifferences
+	for _, res := range parseResources(manifest) {
+		spec, ok := res.Spec.(map[string]any)
+		if !ok {
+			continue
+		}
+		ptrs := nullPointers("/spec", spec)
+		if len(ptrs) == 0 {
+			continue
+		}
+		sort.Strings(ptrs)
+		rules = append(rules, argov1a1.ResourceIgnoreDifferences{
+			Group:        res.Group,
+			Kind:         res.Kind,
+			Name:         res.Name,
+			Namespace:    res.Namespace,
+			JSONPointers: ptrs,
+		})
+	}
+	return rules
+}
+
+// nullPointers returns a JSON pointer per null-valued field. Arrays aren't
+// descended into -- a null element's index-based pointer is too fragile.
+func nullPointers(prefix string, m map[string]any) []string {
+	var ptrs []string
+	for k, v := range m {
+		p := prefix + "/" + escapeJSONPointer(k)
+		switch vv := v.(type) {
+		case nil:
+			ptrs = append(ptrs, p)
+		case map[string]any:
+			ptrs = append(ptrs, nullPointers(p, vv)...)
+		}
+	}
+	return ptrs
+}
+
+// escapeJSONPointer escapes a map key for use in an RFC 6901 JSON pointer.
+func escapeJSONPointer(s string) string {
+	s = strings.ReplaceAll(s, "~", "~0")
+	return strings.ReplaceAll(s, "/", "~1")
+}
+
+// ZeroValuePointers returns a pointer per false/empty-object/array field
+// (dropped by omitempty); zero strings/numbers are kept -- they carry real meaning in Kubernetes APIs.
+func ZeroValuePointers(prefix string, m map[string]any) []string {
+	var ptrs []string
+	for k, v := range m {
+		p := prefix + "/" + escapeJSONPointer(k)
+		switch vv := v.(type) {
+		case bool:
+			if !vv {
+				ptrs = append(ptrs, p)
+			}
+		case map[string]any:
+			if len(vv) == 0 {
+				ptrs = append(ptrs, p)
+			} else {
+				ptrs = append(ptrs, ZeroValuePointers(p, vv)...)
+			}
+		case []any:
+			if len(vv) == 0 {
+				ptrs = append(ptrs, p)
+			}
+		}
+	}
+	return ptrs
+}
+
+// renderedObjects lists every rendered resource that carries a spec map,
+// with enough identity for callers to look up the matching CRD schema.
+func renderedObjects(manifest string) []RenderedObject {
+	var objs []RenderedObject
+	for _, res := range parseResources(manifest) {
+		spec, ok := res.Spec.(map[string]any)
+		if !ok {
+			continue
+		}
+		objs = append(objs, RenderedObject{
+			Group:     res.Group,
+			Version:   res.Version,
+			Kind:      res.Kind,
+			Name:      res.Name,
+			Namespace: res.Namespace,
+			Spec:      spec,
+		})
+	}
+	sort.Slice(objs, func(i, j int) bool {
+		return objs[i].Kind+objs[i].Name < objs[j].Kind+objs[j].Name
+	})
+	return objs
+}
+
+// dedupeRules merges same-resource rules into one, unioning their
+// pointers/expressions -- detection passes can overlap on a resource.
+func dedupeRules(rules []argov1a1.ResourceIgnoreDifferences) []argov1a1.ResourceIgnoreDifferences {
+	index := make(map[string]int, len(rules))
+	var out []argov1a1.ResourceIgnoreDifferences
+	for _, r := range rules {
+		key := r.Group + "/" + r.Kind + "/" + r.Namespace + "/" + r.Name
+		i, ok := index[key]
+		if !ok {
+			index[key] = len(out)
+			out = append(out, r)
+			continue
+		}
+		out[i].JSONPointers = unionStrings(out[i].JSONPointers, r.JSONPointers)
+		out[i].JQPathExpressions = unionStrings(out[i].JQPathExpressions, r.JQPathExpressions)
+	}
+	return out
+}
+
+// unionStrings returns the sorted, deduplicated union of a and b.
+func unionStrings(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	var out []string
+	for _, s := range append(append([]string{}, a...), b...) {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespace, releaseName string, values map[string]any, creds *RegistryCredentials) (manifest, crdManifest string, err error) {
 	settings := cli.New()
 
 	// Build registry client options
@@ -136,7 +374,7 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 		if len(creds.CACert) > 0 || (len(creds.ClientCert) > 0 && len(creds.ClientKey) > 0) {
 			httpClient, err := buildTLSClient(creds)
 			if err != nil {
-				return "", fmt.Errorf("build TLS client: %w", err)
+				return "", "", fmt.Errorf("build TLS client: %w", err)
 			}
 			regOpts = append(regOpts, registry.ClientOptHTTPClient(httpClient))
 		}
@@ -144,7 +382,7 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 
 	regClient, err := registry.NewClient(regOpts...)
 	if err != nil {
-		return "", fmt.Errorf("registry client: %w", err)
+		return "", "", fmt.Errorf("registry client: %w", err)
 	}
 
 	actionConfig := new(action.Configuration)
@@ -161,14 +399,14 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 
 	tmpDir, err := os.MkdirTemp("", "helm-pull-*")
 	if err != nil {
-		return "", fmt.Errorf("temp dir: %w", err)
+		return "", "", fmt.Errorf("temp dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 	pullClient.DestDir = tmpDir
 
 	chartRef := fmt.Sprintf("oci://%s/%s", repoURL, chartName)
 	if _, err := pullClient.Run(chartRef); err != nil {
-		return "", fmt.Errorf("pull %s:%s: %w", chartRef, chartVersion, err)
+		return "", "", fmt.Errorf("pull %s:%s: %w", chartRef, chartVersion, err)
 	}
 
 	// Load chart
@@ -181,18 +419,23 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 		}
 	}
 	if chartPath == "" {
-		return "", fmt.Errorf("no chart found in %s", tmpDir)
+		return "", "", fmt.Errorf("no chart found in %s", tmpDir)
 	}
 
 	chrt, err := loader.Load(chartPath)
 	if err != nil {
-		return "", fmt.Errorf("load chart: %w", err)
+		return "", "", fmt.Errorf("load chart: %w", err)
 	}
 
 	// Render
 	installClient := action.NewInstall(actionConfig)
 	installClient.DryRunOption = "client"
-	installClient.ReleaseName = chartName
+	// Render under the real release name -- otherwise every resource of a
+	// release named differently from its chart would look foreign.
+	installClient.ReleaseName = releaseName
+	if installClient.ReleaseName == "" {
+		installClient.ReleaseName = chartName
+	}
 	installClient.Namespace = namespace
 	installClient.ClientOnly = true
 	installClient.IncludeCRDs = true
@@ -204,15 +447,42 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 
 	rel, err := installClient.RunWithContext(ctx, chrt, values)
 	if err != nil {
-		return "", fmt.Errorf("render: %w", err)
+		return "", "", fmt.Errorf("render: %w", err)
 	}
 
-	return rel.Manifest, nil
+	// Also collect CRDs some charts (e.g. keda) author as regular templates,
+	// invisible to helmCRDNames.
+	var crdDocs []string
+	crdNames := make(map[string]bool)
+	for _, crd := range chrt.CRDObjects() {
+		doc := string(crd.File.Data)
+		crdDocs = append(crdDocs, doc)
+		for _, r := range parseResources(doc) {
+			if r.Kind == "CustomResourceDefinition" {
+				crdNames[r.Name] = true
+			}
+		}
+	}
+	for _, doc := range yamlDocSeparator.Split(rel.Manifest, -1) {
+		doc = strings.TrimSpace(doc)
+		if doc == "" {
+			continue
+		}
+		for _, r := range parseResources(doc) {
+			if r.Kind == "CustomResourceDefinition" && !crdNames[r.Name] {
+				crdNames[r.Name] = true
+				crdDocs = append(crdDocs, doc)
+			}
+		}
+	}
+
+	return rel.Manifest, strings.Join(crdDocs, "\n---\n"), nil
 }
 
 // Resource represents a parsed Kubernetes resource
 type Resource struct {
 	Group     string
+	Version   string
 	Kind      string
 	Name      string
 	Namespace string
@@ -226,13 +496,17 @@ func (r *Resource) Key() string {
 	return fmt.Sprintf("%s/%s/%s/%s", r.Group, r.Kind, r.Namespace, r.Name)
 }
 
+// yamlDocSeparator matches a "---" line exactly; splitting on the bare
+// substring would shred embedded PEM blocks in string values.
+var yamlDocSeparator = regexp.MustCompile(`(?m)^---\s*$`)
+
 func parseResources(rendered string) map[string]*Resource {
 	resources := make(map[string]*Resource)
-	docs := strings.Split(rendered, "---")
+	docs := yamlDocSeparator.Split(rendered, -1)
 
 	for _, doc := range docs {
 		doc = strings.TrimSpace(doc)
-		if doc == "" || strings.HasPrefix(doc, "---") {
+		if doc == "" {
 			continue
 		}
 
@@ -251,14 +525,15 @@ func parseResources(rendered string) map[string]*Resource {
 			continue
 		}
 
-		group := ""
+		group, version := "", apiVersion
 		parts := strings.SplitN(apiVersion, "/", 2)
 		if len(parts) == 2 {
-			group = parts[0]
+			group, version = parts[0], parts[1]
 		}
 
 		resources[fmt.Sprintf("%s/%s/%s/%s", group, kind, ns, name)] = &Resource{
 			Group:     group,
+			Version:   version,
 			Kind:      kind,
 			Name:      name,
 			Namespace: ns,
@@ -333,11 +608,17 @@ func findIgnoreDifferences(renders []string) []argov1a1.ResourceIgnoreDifference
 				continue
 			}
 
-			// Check Secret data changes
-			if res1.Kind == "Secret" && !deepEqualJSON(res1.Data, res2.Data) {
-				if isCertificateData(res1.Data) || isCertificateData(res2.Data) {
+			// A Secret/ConfigMap payload that differs between renders is
+			// generated or lookup-guarded -- leave the live value alone.
+			if res1.Kind == "Secret" || res1.Kind == "ConfigMap" {
+				if !deepEqualJSON(res1.Data, res2.Data) {
 					r := addRule(res1)
 					addPointer(r, "/data")
+				}
+				if !deepEqualJSON(res1.Raw["stringData"], res2.Raw["stringData"]) {
+					r := addRule(res1)
+					addPointer(r, "/data")
+					addPointer(r, "/stringData")
 				}
 			}
 
@@ -412,20 +693,6 @@ func findIgnoreDifferences(renders []string) []argov1a1.ResourceIgnoreDifference
 	})
 
 	return rules
-}
-
-func isCertificateData(data any) bool {
-	m, ok := data.(map[string]any)
-	if !ok {
-		return false
-	}
-	for key := range m {
-		if key == "ca.crt" || key == "tls.crt" || key == "tls.key" ||
-			strings.HasSuffix(key, ".crt") || strings.HasSuffix(key, ".key") {
-			return true
-		}
-	}
-	return false
 }
 
 func diffAnnotations(metaA, metaB map[string]any, prefix string) []string {
