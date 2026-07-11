@@ -390,7 +390,7 @@ webhooks:
 	// Check Secret
 	secret, ok := resources["/Secret/default/test-secret"]
 	if !ok {
-		var keys []string
+		keys := make([]string, 0, len(resources))
 		for k := range resources {
 			keys = append(keys, k)
 		}
