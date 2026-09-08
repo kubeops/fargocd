@@ -20,7 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"kubeops.dev/fargocd/pkg/ignoregen"
@@ -34,7 +36,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -44,6 +48,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -108,6 +113,221 @@ type HelmReleaseReconciler struct {
 	// the Application name (so multiple clusters can share one principal
 	// without colliding) and as the agent label value.
 	ClusterName string
+
+	// helmCRDs elects a single owner per CRD when several releases vendor
+	// the same one. The zero value is ready to use.
+	helmCRDs helmCRDRegistry
+
+	// crdSchemas caches, per custom-resource GVK, which top-level spec
+	// fields the live CRD schema declares. The zero value is ready to use.
+	crdSchemas crdSchemaCache
+}
+
+// crdSchemaCache memoises CRD spec schemas fetched from the workload
+// cluster. Entries expire so a CRD upgrade is picked up without a restart.
+type crdSchemaCache struct {
+	mu      sync.Mutex
+	entries map[string]crdSchemaEntry
+}
+
+type crdSchemaEntry struct {
+	// fields holds the declared top-level names under spec.properties.
+	fields map[string]struct{}
+	// preserveUnknown is true when the schema keeps unknown fields, in
+	// which case nothing gets pruned and no rules are needed.
+	preserveUnknown bool
+	// found is false when no CRD exists for the GVK (built-in kind or CRD
+	// not installed yet).
+	found     bool
+	fetchedAt time.Time
+}
+
+const crdSchemaCacheTTL = 10 * time.Minute
+
+func (c *crdSchemaCache) get(key string) (crdSchemaEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if !ok || time.Since(e.fetchedAt) > crdSchemaCacheTTL {
+		return crdSchemaEntry{}, false
+	}
+	return e, true
+}
+
+func (c *crdSchemaCache) put(key string, e crdSchemaEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]crdSchemaEntry)
+	}
+	e.fetchedAt = time.Now()
+	c.entries[key] = e
+}
+
+// helmCRDRegistry elects a deterministic CRD owner per HelmRelease. Safe
+// for concurrent use; the zero value is ready.
+type helmCRDRegistry struct {
+	mu sync.Mutex
+	// byRelease maps "<namespace>/<name>" of a HelmRelease to the set of
+	// CRD names its chart ships in crds/.
+	byRelease map[string]map[string]struct{}
+}
+
+// remove forgets a release entirely, releasing any CRD ownership it held so
+// the election falls to the remaining releases that still ship the CRD.
+func (g *helmCRDRegistry) remove(release string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.byRelease, release)
+}
+
+// set replaces the recorded crds/ set for a release.
+func (g *helmCRDRegistry) set(release string, crds []string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.byRelease == nil {
+		g.byRelease = make(map[string]map[string]struct{})
+	}
+	s := make(map[string]struct{}, len(crds))
+	for _, c := range crds {
+		s[c] = struct{}{}
+	}
+	g.byRelease[release] = s
+}
+
+// undeclaredSpecFieldRules ignores spec fields the live CRD schema doesn't
+// declare -- lenient apply prunes them silently, so they'd diff forever.
+func (r *HelmReleaseReconciler) undeclaredSpecFieldRules(ctx context.Context, objects []ignoregen.RenderedObject) []argov1a1.ResourceIgnoreDifferences {
+	var rules []argov1a1.ResourceIgnoreDifferences
+	for _, obj := range objects {
+		if obj.Group == "" || len(obj.Spec) == 0 {
+			// Core kinds are not CRDs; nothing to look up.
+			continue
+		}
+		entry, err := r.lookupCRDSchema(ctx, obj)
+		if err != nil || !entry.found || entry.preserveUnknown {
+			continue
+		}
+
+		var ptrs []string
+		for field := range obj.Spec {
+			if _, declared := entry.fields[field]; !declared {
+				ptrs = append(ptrs, "/spec/"+strings.ReplaceAll(strings.ReplaceAll(field, "~", "~0"), "/", "~1"))
+			}
+		}
+		if len(ptrs) == 0 {
+			continue
+		}
+		sort.Strings(ptrs)
+		rules = append(rules, argov1a1.ResourceIgnoreDifferences{
+			Group:        obj.Group,
+			Kind:         obj.Kind,
+			Name:         obj.Name,
+			Namespace:    obj.Namespace,
+			JSONPointers: ptrs,
+		})
+	}
+	return rules
+}
+
+// zeroValueSpecFieldRules ignores zero-valued CR spec fields: the owning
+// controller's own omitempty round-trip drops them from the live object.
+func (r *HelmReleaseReconciler) zeroValueSpecFieldRules(ctx context.Context, objects []ignoregen.RenderedObject) []argov1a1.ResourceIgnoreDifferences {
+	var rules []argov1a1.ResourceIgnoreDifferences
+	for _, obj := range objects {
+		if obj.Group == "" || len(obj.Spec) == 0 {
+			// Core kinds are not CRDs; nothing to look up.
+			continue
+		}
+		entry, err := r.lookupCRDSchema(ctx, obj)
+		if err != nil || !entry.found {
+			continue
+		}
+		ptrs := ignoregen.ZeroValuePointers("/spec", obj.Spec)
+		if len(ptrs) == 0 {
+			continue
+		}
+		sort.Strings(ptrs)
+		rules = append(rules, argov1a1.ResourceIgnoreDifferences{
+			Group:        obj.Group,
+			Kind:         obj.Kind,
+			Name:         obj.Name,
+			Namespace:    obj.Namespace,
+			JSONPointers: ptrs,
+		})
+	}
+	return rules
+}
+
+// lookupCRDSchema resolves the CRD backing a rendered object's GVK and
+// returns its declared top-level spec fields, memoised in crdSchemas.
+func (r *HelmReleaseReconciler) lookupCRDSchema(ctx context.Context, obj ignoregen.RenderedObject) (crdSchemaEntry, error) {
+	key := obj.Group + "/" + obj.Version + "/" + obj.Kind
+	if e, ok := r.crdSchemas.get(key); ok {
+		return e, nil
+	}
+
+	mapping, err := r.RESTMapper().RESTMapping(schema.GroupKind{Group: obj.Group, Kind: obj.Kind}, obj.Version)
+	if err != nil {
+		// Unknown kind (CRD not installed yet): try again next reconcile.
+		return crdSchemaEntry{}, err
+	}
+
+	crd := &unstructured.Unstructured{}
+	crd.SetGroupVersionKind(schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"})
+	crdName := mapping.Resource.Resource + "." + obj.Group
+	if err := r.Get(ctx, types.NamespacedName{Name: crdName}, crd); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Built-in aggregated API or similar: no CRD, nothing pruned by
+			// structural schemas. Cache the miss.
+			e := crdSchemaEntry{found: false}
+			r.crdSchemas.put(key, e)
+			return e, nil
+		}
+		return crdSchemaEntry{}, err
+	}
+
+	entry := crdSchemaEntry{found: true, fields: map[string]struct{}{}}
+	versions, _, _ := unstructured.NestedSlice(crd.Object, "spec", "versions")
+	for _, v := range versions {
+		vm, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name, _ := vm["name"].(string); name != obj.Version {
+			continue
+		}
+		specSchema, _, _ := unstructured.NestedMap(vm, "schema", "openAPIV3Schema", "properties", "spec")
+		if preserve, _ := specSchema["x-kubernetes-preserve-unknown-fields"].(bool); preserve {
+			entry.preserveUnknown = true
+			break
+		}
+		props, _ := specSchema["properties"].(map[string]any)
+		for field := range props {
+			entry.fields[field] = struct{}{}
+		}
+		break
+	}
+
+	r.crdSchemas.put(key, entry)
+	return entry, nil
+}
+
+// owner deterministically elects the lexicographically smallest release
+// key among those shipping crd, so every reconcile agrees on one writer.
+func (g *helmCRDRegistry) owner(crd string) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	owner := ""
+	for release, crds := range g.byRelease {
+		if _, ok := crds[crd]; !ok {
+			continue
+		}
+		if owner == "" || release < owner {
+			owner = release
+		}
+	}
+	return owner
 }
 
 // Reconcile implements the controller-runtime contract.
@@ -180,28 +400,55 @@ func (r *HelmReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 func (r *HelmReleaseReconciler) reconcileDelete(ctx context.Context, hr *fluxhelmv2.HelmRelease, argoNamespace string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	if controllerutil.ContainsFinalizer(hr, FinalizerName) {
-		if err := r.deleteApplication(ctx, hr, argoNamespace); err != nil {
-			logger.Error(err, "failed to delete Application")
-			return ctrl.Result{}, err
-		}
-		controllerutil.RemoveFinalizer(hr, FinalizerName)
-		if err := r.Update(ctx, hr); err != nil {
-			return ctrl.Result{}, err
-		}
+	if !controllerutil.ContainsFinalizer(hr, FinalizerName) {
+		return ctrl.Result{}, nil
+	}
+
+	gone, err := r.deleteApplication(ctx, hr, argoNamespace)
+	if err != nil {
+		logger.Error(err, "failed to delete Application")
+		return ctrl.Result{}, err
+	}
+	if !gone {
+		// Argo CD's cascade delete is async -- requeue instead of removing
+		// our own finalizer while it's still pruning.
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	r.helmCRDs.remove(hr.Namespace + "/" + hr.Name)
+	controllerutil.RemoveFinalizer(hr, FinalizerName)
+	if err := r.Update(ctx, hr); err != nil {
+		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
 }
 
-// deleteApplication removes the Application that mirrors hr.
-func (r *HelmReleaseReconciler) deleteApplication(ctx context.Context, hr *fluxhelmv2.HelmRelease, argoNamespace string) error {
+// deleteApplication ensures the Application mirroring hr is gone, waiting
+// out Argo CD's cascading delete. Returns true once it no longer exists.
+func (r *HelmReleaseReconciler) deleteApplication(ctx context.Context, hr *fluxhelmv2.HelmRelease, argoNamespace string) (bool, error) {
 	app := &argov1a1.Application{}
-	app.Name = r.appName(hr)
-	app.Namespace = argoNamespace
-	if err := r.ArgoClient.Delete(ctx, app); err != nil && !apierrors.IsNotFound(err) {
-		return err
+	key := client.ObjectKey{Name: r.appName(hr), Namespace: argoNamespace}
+	if err := r.ArgoClient.Get(ctx, key, app); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
 	}
-	return nil
+	if app.DeletionTimestamp.IsZero() {
+		if err := r.ArgoClient.Delete(ctx, app); err != nil && !apierrors.IsNotFound(err) {
+			return false, err
+		}
+	}
+
+	// Applications without the cascade finalizer (e.g. pre-upgrade) delete
+	// immediately; ones carrying it stick around until Argo CD finishes pruning.
+	if err := r.ArgoClient.Get(ctx, key, app); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
 }
 
 // appName projects an HelmRelease into an Application name. It honours the
@@ -227,10 +474,8 @@ func (r *HelmReleaseReconciler) resolveArgoNamespace(ctx context.Context) (strin
 	return services.Items[0].Namespace, nil
 }
 
-// checkDependenciesHealth verifies that every HelmRelease listed in
-// spec.dependsOn has produced a Healthy Application. The second return
-// value is the name of the first dependency we found unhealthy, useful for
-// log messages.
+// checkDependenciesHealth gates spec.dependsOn on Synced + (Healthy or
+// Progressing), not full health, to match Flux's own semantics and avoid deadlocking bootstrap-cycle stacks.
 func (r *HelmReleaseReconciler) checkDependenciesHealth(ctx context.Context, hr *fluxhelmv2.HelmRelease, argoNamespace string) (bool, string) {
 	if len(hr.Spec.DependsOn) == 0 {
 		return true, ""
@@ -249,7 +494,16 @@ func (r *HelmReleaseReconciler) checkDependenciesHealth(ctx context.Context, hr 
 		if err != nil {
 			return false, depAppName
 		}
-		if depApp.Status.Health.Status != health.HealthStatusHealthy {
+		// "Installed": synced, or last sync succeeded -- drift alone mustn't
+		// block dependents, or shared-resource drift could never resolve.
+		if depApp.Status.Sync.Status != argov1a1.SyncStatusCodeSynced &&
+			(depApp.Status.OperationState == nil || !depApp.Status.OperationState.Phase.Successful()) {
+			return false, depAppName
+		}
+		switch depApp.Status.Health.Status {
+		case health.HealthStatusHealthy, health.HealthStatusProgressing:
+			// Applied and converging: good enough to unblock dependents.
+		default:
 			return false, depAppName
 		}
 	}
@@ -280,6 +534,10 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 		return err
 	}
 	app.Annotations[HelmReleaseAnnotation] = hrRef
+
+	// Argo CD's own cascade-delete finalizer, so deleting this Application
+	// prunes its deployed resources instead of abandoning them.
+	controllerutil.AddFinalizer(app, argov1a1.ResourcesFinalizerName)
 
 	// Agent label is meaningful only in managed mode.
 	if r.Mode == mode.Managed && r.ClusterName != "" {
@@ -337,12 +595,21 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 		Destination: destination,
 		SyncPolicy: &argov1a1.SyncPolicy{
 			Automated: &argov1a1.SyncPolicyAutomated{
-				Prune:    true,
-				SelfHeal: true,
+				Prune: true,
+				// No selfHeal, matching FluxCD's own opt-in drift detection --
+				// continuous re-assertion would fight operators rewriting their own CRs.
+				SelfHeal: false,
 			},
 			SyncOptions: argov1a1.SyncOptions{
 				"CreateNamespace=true",
-				"ServerSideApply=true",
+				// Matches Helm's lenient validation; Argo CD defaults to
+				// strict and would hard-fail syncs Helm accepts.
+				"Validate=false",
+				// Needed for the ignoreDifferences rules above to actually
+				// stop a shared/oversized CRD from being re-applied every sync.
+				"ApplyOutOfSyncOnly=true",
+				// No ServerSideApply: it hard-fails on chart output Helm's
+				// client-side apply quietly tolerates (e.g. explicit nulls).
 			},
 		},
 	}
@@ -353,22 +620,199 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 	if err != nil {
 		logger.Error(err, "failed to resolve registry credentials; proceeding without auth")
 	}
-	rules, err := ignoregen.DetectIgnoreDifferences(
+	detected, err := ignoregen.DetectIgnoreDifferences(
 		ctx,
 		hr.Spec.Chart.Spec.Chart,
 		hr.Spec.Chart.Spec.Version,
 		strings.TrimPrefix(repoURL, "oci://"),
 		hr.GetReleaseNamespace(),
+		hr.GetReleaseName(),
 		values.AsMap(),
 		creds,
 	)
 	if err != nil {
 		logger.Error(err, "failed to auto-detect ignoreDifferences; proceeding without")
-	} else {
-		app.Spec.IgnoreDifferences = rules
+		detected = ignoregen.Result{}
+	}
+	rules := detected.Rules
+
+	// Several charts commonly vendor the same untemplated CRD; electing one
+	// owner keeps schema upgrades flowing while every other release backs off.
+	hrKey := hr.Namespace + "/" + hr.Name
+	r.helmCRDs.set(hrKey, detected.HelmCRDs)
+	oversized := make(map[string]bool, len(detected.OversizedHelmCRDs))
+	for _, crd := range detected.OversizedHelmCRDs {
+		oversized[crd] = true
 	}
 
+	// Argo CD can't even create oversized CRDs (client-side apply's own
+	// annotation exceeds the size cap); create any missing ones directly.
+	r.ensureOversizedCRDs(ctx, detected.OversizedHelmCRDDocs)
+	for _, crd := range detected.HelmCRDs {
+		// The elected owner keeps managing it, unless oversized -- then not
+		// even the owner can patch it, so it's install-once for everyone.
+		if r.helmCRDs.owner(crd) == hrKey && !oversized[crd] {
+			continue
+		}
+		rules = append(rules, argov1a1.ResourceIgnoreDifferences{
+			Group:        "apiextensions.k8s.io",
+			Kind:         "CustomResourceDefinition",
+			Name:         crd,
+			JSONPointers: []string{"/spec", "/metadata/labels", "/metadata/annotations"},
+		})
+	}
+
+	// Fields the CRD schema doesn't declare get pruned by the API server
+	// under lenient apply and would diff forever; ignore them.
+	rules = append(rules, r.undeclaredSpecFieldRules(ctx, detected.Objects)...)
+
+	// Zero-valued CR spec fields (false, {}, []) get dropped by the owning
+	// controller's omitempty round-trip and would diff forever; ignore them.
+	rules = append(rules, r.zeroValueSpecFieldRules(ctx, detected.Objects)...)
+
+	// Break the fight Argo CD reports via Shared/RepeatedResourceWarning by
+	// ignoring the mutable parts of the contested resource; self-clears once the warning stops.
+	app.Spec.IgnoreDifferences = append(rules, sharedResourceIgnoreRules(app.Status)...)
+
 	return nil
+}
+
+// ensureOversizedCRDs directly creates any missing chart CRD too large for
+// Argo CD's own client-side apply to create. Failures are only logged.
+func (r *HelmReleaseReconciler) ensureOversizedCRDs(ctx context.Context, docs map[string]string) {
+	logger := log.FromContext(ctx)
+	crdGVK := schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}
+	for name, doc := range docs {
+		existing := &unstructured.Unstructured{}
+		existing.SetGroupVersionKind(crdGVK)
+		err := r.Get(ctx, types.NamespacedName{Name: name}, existing)
+		if err == nil {
+			continue
+		}
+		if !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to check for oversized chart CRD", "crd", name)
+			continue
+		}
+		obj := &unstructured.Unstructured{}
+		if err := yaml.Unmarshal([]byte(doc), &obj.Object); err != nil {
+			logger.Error(err, "failed to parse oversized chart CRD", "crd", name)
+			continue
+		}
+		if err := r.Create(ctx, obj); err != nil && !apierrors.IsAlreadyExists(err) {
+			logger.Error(err, "failed to create oversized chart CRD", "crd", name)
+			continue
+		}
+		logger.Info("created chart CRD too large for client-side apply", "crd", name)
+	}
+}
+
+// sharedResourceIgnoreRules derives an ignoreDifferences rule for each
+// resource named in a Repeated/SharedResourceWarning condition.
+func sharedResourceIgnoreRules(status argov1a1.ApplicationStatus) []argov1a1.ResourceIgnoreDifferences {
+	var rules []argov1a1.ResourceIgnoreDifferences
+	for _, cond := range status.Conditions {
+		var key resourceKey
+		var ok bool
+
+		switch cond.Type {
+		case argov1a1.ApplicationConditionRepeatedResourceWarning:
+			// Message embeds the full Group/Kind/Namespace/Name key directly.
+			key, ok = parseRepeatedResourceWarning(cond.Message)
+		case argov1a1.ApplicationConditionSharedResourceWarning:
+			// Message only names Kind/Name; resolve Group/Namespace from
+			// this Application's own resource inventory.
+			var kind, name string
+			kind, name, ok = parseSharedResourceWarning(cond.Message)
+			if ok {
+				key, ok = lookupResourceKey(status.Resources, kind, name)
+			}
+		default:
+			continue
+		}
+		if !ok {
+			continue
+		}
+
+		rules = append(rules, argov1a1.ResourceIgnoreDifferences{
+			Group:     key.group,
+			Kind:      key.kind,
+			Namespace: key.namespace,
+			Name:      key.name,
+			// Two charts sharing a resource also disagree on chart/version
+			// labels, not just spec -- ignore both.
+			JSONPointers: []string{"/spec", "/metadata/labels", "/metadata/annotations"},
+		})
+	}
+	return rules
+}
+
+// lookupResourceKey finds the Group/Namespace for a Kind+Name pair by
+// searching this Application's own reported resources.
+func lookupResourceKey(resources []argov1a1.ResourceStatus, kind, name string) (resourceKey, bool) {
+	for _, r := range resources {
+		if r.Kind == kind && r.Name == name {
+			return resourceKey{group: r.Group, kind: r.Kind, namespace: r.Namespace, name: r.Name}, true
+		}
+	}
+	return resourceKey{}, false
+}
+
+type resourceKey struct {
+	group     string
+	kind      string
+	namespace string
+	name      string
+}
+
+// repeatedResourceWarningPrefix/Suffix bracket the gitops-engine
+// ResourceKey.String() embedded in Argo CD's condition message.
+const (
+	repeatedResourceWarningPrefix = "Resource "
+	repeatedResourceWarningSuffix = " appeared "
+)
+
+// parseRepeatedResourceWarning extracts the resource key from Argo CD's
+// condition message; ok=false on an unrecognized shape (fail safe).
+func parseRepeatedResourceWarning(message string) (resourceKey, bool) {
+	if !strings.HasPrefix(message, repeatedResourceWarningPrefix) {
+		return resourceKey{}, false
+	}
+	rest := strings.TrimPrefix(message, repeatedResourceWarningPrefix)
+	idx := strings.Index(rest, repeatedResourceWarningSuffix)
+	if idx < 0 {
+		return resourceKey{}, false
+	}
+	key := rest[:idx]
+
+	parts := strings.SplitN(key, "/", 4)
+	if len(parts) != 4 {
+		return resourceKey{}, false
+	}
+	if parts[1] == "" || parts[3] == "" {
+		// Kind and Name are always non-empty; Group and Namespace may be.
+		return resourceKey{}, false
+	}
+	return resourceKey{group: parts[0], kind: parts[1], namespace: parts[2], name: parts[3]}, true
+}
+
+// sharedResourceWarningSeparator splits "<Kind>/<Name>" from the rest of
+// Argo CD's message; unlike Repeated, it carries no Group/Namespace.
+const sharedResourceWarningSeparator = " is part of applications "
+
+// parseSharedResourceWarning extracts Kind/Name from Argo CD's condition
+// message; ok=false on an unrecognized shape (fail safe).
+func parseSharedResourceWarning(message string) (kind, name string, ok bool) {
+	idx := strings.Index(message, sharedResourceWarningSeparator)
+	if idx < 0 {
+		return "", "", false
+	}
+	key := message[:idx]
+
+	parts := strings.SplitN(key, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
 
 // getHelmRepository looks up the HelmRepository referenced by hr and returns
@@ -460,14 +904,21 @@ func (r *HelmReleaseReconciler) updateHelmReleaseStatus(ctx context.Context, hr 
 	now := metav1.Now()
 
 	if app.Status.Sync.Status != "" {
+		// Flux's Ready means "install succeeded", not "zero drift" -- without
+		// selfHeal, legitimate drift can leave this OutOfSync yet still ready.
 		readyStatus := metav1.ConditionFalse
-		if app.Status.Sync.Status == argov1a1.SyncStatusCodeSynced {
+		reason := string(app.Status.Sync.Status)
+		switch {
+		case app.Status.Sync.Status == argov1a1.SyncStatusCodeSynced:
 			readyStatus = metav1.ConditionTrue
+		case app.Status.OperationState != nil && app.Status.OperationState.Phase.Successful():
+			readyStatus = metav1.ConditionTrue
+			reason = "SyncSucceeded"
 		}
 		conditions = append(conditions, metav1.Condition{
 			Type:               "Ready",
 			Status:             readyStatus,
-			Reason:             string(app.Status.Sync.Status),
+			Reason:             reason,
 			Message:            "synced state mirrored from Argo CD Application",
 			LastTransitionTime: now,
 		})

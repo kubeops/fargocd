@@ -21,6 +21,8 @@ import (
 	"os"
 	"slices"
 
+	"kubeops.dev/fargocd/pkg/mode"
+
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	kmapi "kmodules.xyz/client-go/api/v1"
 	"open-cluster-management.io/addon-framework/pkg/addonfactory"
@@ -36,6 +38,10 @@ import (
 // taken from cluster.Name; on OpenShift spokes the chart's runAsUser /
 // fsGroup are cleared so it falls back to the project's SCC range.
 func GetConfigValues(opts *ManagerOptions) (addonfactory.GetValuesFunc, error) {
+	if _, err := mode.Parse(opts.Mode); err != nil {
+		return nil, err
+	}
+
 	var argoKubeconfig string
 	if opts.ArgoKubeconfigFile != "" {
 		raw, err := os.ReadFile(opts.ArgoKubeconfigFile)
@@ -43,6 +49,12 @@ func GetConfigValues(opts *ManagerOptions) (addonfactory.GetValuesFunc, error) {
 			return nil, fmt.Errorf("read --argo-kubeconfig-file: %w", err)
 		}
 		argoKubeconfig = string(raw)
+	}
+
+	// Computed once and reused every render -- see generateServingCert.
+	serverCrt, serverKey, caCrt, err := generateServingCert()
+	if err != nil {
+		return nil, fmt.Errorf("generate operator serving cert: %w", err)
 	}
 
 	return func(cluster *clusterv1.ManagedCluster, _ *addonv1alpha1.ManagedClusterAddOn) (addonfactory.Values, error) {
@@ -81,6 +93,14 @@ func GetConfigValues(opts *ManagerOptions) (addonfactory.GetValuesFunc, error) {
 		overrides := map[string]any{
 			"argocd":          argocd,
 			"imagePullPolicy": "Always",
+			"apiserver": map[string]any{
+				"servingCerts": map[string]any{
+					"generate":  false,
+					"caCrt":     caCrt,
+					"serverCrt": serverCrt,
+					"serverKey": serverKey,
+				},
+			},
 		}
 		if opts.RegistryFQDN != "" {
 			overrides["registryFQDN"] = opts.RegistryFQDN

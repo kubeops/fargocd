@@ -31,14 +31,17 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 // stubIgnoreDetect short-circuits the helm-pull/render pipeline so unit
@@ -46,8 +49,8 @@ import (
 func stubIgnoreDetect(t *testing.T) {
 	t.Helper()
 	orig := ignoregen.DetectFn
-	ignoregen.DetectFn = func(_ context.Context, _ string, _ string, _ string, _ string, _ map[string]any, _ *ignoregen.RegistryCredentials) ([]argov1a1.ResourceIgnoreDifferences, error) {
-		return nil, nil
+	ignoregen.DetectFn = func(_ context.Context, _ string, _ string, _ string, _ string, _ string, _ map[string]any, _ *ignoregen.RegistryCredentials) (ignoregen.Result, error) {
+		return ignoregen.Result{}, nil
 	}
 	t.Cleanup(func() { ignoregen.DetectFn = orig })
 }
@@ -59,6 +62,7 @@ func newScheme(t *testing.T) *runtime.Scheme {
 	utilruntime.Must(fluxhelmv2.AddToScheme(sch))
 	utilruntime.Must(fluxsrcv1.AddToScheme(sch))
 	utilruntime.Must(argov1a1.AddToScheme(sch))
+	utilruntime.Must(apiextensionsv1.AddToScheme(sch))
 	return sch
 }
 
@@ -338,6 +342,114 @@ func TestReconcile_DeleteCleansApplication(t *testing.T) {
 	}
 }
 
+// Verifies every Application carries Argo CD's resources-finalizer, so
+// deleting the HelmRelease tears down what it deployed.
+func TestReconcile_ApplicationCarriesCascadeFinalizer(t *testing.T) {
+	stubIgnoreDetect(t)
+	sch := newScheme(t)
+
+	hr := sampleHelmRelease("kubedb", "kubedb")
+	repo := sampleHelmRepository()
+	c := fake.NewClientBuilder().
+		WithScheme(sch).
+		WithObjects(hr, repo, sampleArgoNS(), sampleArgoServerService()).
+		WithStatusSubresource(&fluxhelmv2.HelmRelease{}, &argov1a1.Application{}).
+		Build()
+
+	r := &HelmReleaseReconciler{
+		Client:            c,
+		Scheme:            sch,
+		ArgoClient:        c,
+		Mode:              mode.InCluster,
+		DestinationServer: "https://kubernetes.default.svc",
+		Project:           "default",
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "kubedb", Namespace: "default"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var app argov1a1.Application
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "kubedb", Namespace: "argocd"}, &app); err != nil {
+		t.Fatalf("application not created: %v", err)
+	}
+	found := false
+	for _, f := range app.Finalizers {
+		if f == argov1a1.ResourcesFinalizerName {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Application missing %q finalizer; deleting the HelmRelease would orphan its workloads", argov1a1.ResourcesFinalizerName)
+	}
+}
+
+// Verifies fargocd requeues (not removes its own finalizer) while the
+// Application still carries Argo CD's cascade finalizer.
+func TestReconcile_DeleteWaitsForCascade(t *testing.T) {
+	stubIgnoreDetect(t)
+	sch := newScheme(t)
+
+	now := metav1.Now()
+	hr := sampleHelmRelease("kubedb", "kubedb")
+	hr.DeletionTimestamp = &now
+
+	app := &argov1a1.Application{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "kubedb",
+			Namespace:  "argocd",
+			Finalizers: []string{argov1a1.ResourcesFinalizerName},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(sch).
+		WithObjects(hr, app).
+		WithStatusSubresource(&fluxhelmv2.HelmRelease{}, &argov1a1.Application{}).
+		Build()
+
+	r := &HelmReleaseReconciler{
+		Client:        c,
+		Scheme:        sch,
+		ArgoClient:    c,
+		Mode:          mode.InCluster,
+		ArgoNamespace: "argocd",
+	}
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "kubedb", Namespace: "default"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("expected a requeue while cascade delete is in flight, got %v", res)
+	}
+
+	// Application and HelmRelease finalizers must both still be present
+	// -- Argo CD hasn't finished tearing down the workload yet.
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "kubedb", Namespace: "argocd"}, app); err != nil {
+		t.Fatalf("application should still exist mid-cascade: %v", err)
+	}
+	var post fluxhelmv2.HelmRelease
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "kubedb", Namespace: "default"}, &post); err != nil {
+		t.Fatalf("get HelmRelease: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(&post, FinalizerName) {
+		t.Errorf("HelmRelease finalizer removed before Argo CD finished the cascade delete")
+	}
+
+	// Simulate Argo CD dropping its finalizer -- fargocd should complete
+	// teardown on the next reconcile.
+	app.Finalizers = nil
+	if err := c.Update(context.Background(), app); err != nil {
+		t.Fatalf("simulate Argo CD completing cascade: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "kubedb", Namespace: "default"}}); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "kubedb", Namespace: "default"}, &post); err == nil {
+		if controllerutil.ContainsFinalizer(&post, FinalizerName) {
+			t.Errorf("HelmRelease finalizer not removed after Argo CD completed the cascade")
+		}
+	}
+}
+
 // TestReconcile_AddsFinalizerIfMissing verifies the requeue-after-finalizer
 // pattern leaves the Application uncreated on first pass.
 func TestReconcile_AddsFinalizerIfMissing(t *testing.T) {
@@ -490,3 +602,197 @@ func TestStatusMirrorsApplicationConditions(t *testing.T) {
 }
 
 var _ = client.IgnoreNotFound
+
+// Verifies zero-valued CR spec fields get ignoreDifferences pointers, and
+// kinds without a backing CRD are left alone.
+func TestZeroValueSpecFieldRules(t *testing.T) {
+	sch := newScheme(t)
+	utilruntime.Must(apiextensionsv1.AddToScheme(sch))
+
+	crd := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "features.ui.k8s.appscode.com"},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Group: "ui.k8s.appscode.com",
+			Names: apiextensionsv1.CustomResourceDefinitionNames{Plural: "features", Kind: "Feature"},
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
+				{Name: "v1alpha1", Served: true, Storage: true},
+			},
+		},
+	}
+
+	mapper := apimeta.NewDefaultRESTMapper(nil)
+	mapper.Add(schema.GroupVersionKind{Group: "ui.k8s.appscode.com", Version: "v1alpha1", Kind: "Feature"}, apimeta.RESTScopeRoot)
+	mapper.Add(schema.GroupVersionKind{Group: "missing.example.com", Version: "v1", Kind: "Widget"}, apimeta.RESTScopeNamespace)
+
+	cl := fake.NewClientBuilder().WithScheme(sch).WithRESTMapper(mapper).WithObjects(crd).Build()
+	r := &HelmReleaseReconciler{Client: cl, Scheme: sch}
+
+	rules := r.zeroValueSpecFieldRules(context.Background(), []ignoregen.RenderedObject{
+		{
+			Group: "ui.k8s.appscode.com", Version: "v1alpha1", Kind: "Feature", Name: "metrics-server",
+			Spec: map[string]any{
+				"recommended": false,
+				"title":       "Metrics Server",
+				"chart":       map[string]any{"name": "metrics-server"},
+			},
+		},
+		{
+			// No CRD installed for this GVK: no rule.
+			Group: "missing.example.com", Version: "v1", Kind: "Widget", Name: "w",
+			Spec: map[string]any{"enabled": false},
+		},
+		{
+			// Core group: never CRD-backed, skipped outright.
+			Group: "", Version: "v1", Kind: "Service", Name: "svc",
+			Spec: map[string]any{"allocateLoadBalancerNodePorts": false},
+		},
+	})
+
+	if len(rules) != 1 {
+		t.Fatalf("expected exactly one rule, got %+v", rules)
+	}
+	rule := rules[0]
+	if rule.Group != "ui.k8s.appscode.com" || rule.Kind != "Feature" || rule.Name != "metrics-server" {
+		t.Fatalf("rule targets the wrong resource: %+v", rule)
+	}
+	if len(rule.JSONPointers) != 1 || rule.JSONPointers[0] != "/spec/recommended" {
+		t.Fatalf("pointers = %v, want [/spec/recommended]", rule.JSONPointers)
+	}
+}
+
+// stubOversizedCRDDetect stubs DetectFn with a Result that ships one CRD too
+// large for client-side apply, plus its raw manifest.
+func stubOversizedCRDDetect(t *testing.T, crdName, crdDoc string) {
+	t.Helper()
+	orig := ignoregen.DetectFn
+	ignoregen.DetectFn = func(_ context.Context, _ string, _ string, _ string, _ string, _ string, _ map[string]any, _ *ignoregen.RegistryCredentials) (ignoregen.Result, error) {
+		return ignoregen.Result{
+			HelmCRDs:             []string{crdName},
+			OversizedHelmCRDs:    []string{crdName},
+			OversizedHelmCRDDocs: map[string]string{crdName: crdDoc},
+		}, nil
+	}
+	t.Cleanup(func() { ignoregen.DetectFn = orig })
+}
+
+const oversizedCRDName = "prometheuses.monitoring.coreos.com"
+
+const oversizedCRDDoc = `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: prometheuses.monitoring.coreos.com
+spec:
+  group: monitoring.coreos.com
+  scope: Namespaced
+  names:
+    kind: Prometheus
+    listKind: PrometheusList
+    plural: prometheuses
+    singular: prometheus
+`
+
+// Verifies an oversized chart CRD is created directly (Argo CD's own apply
+// can't), while the Application keeps client-side apply and ignores it after.
+func TestReconcile_CreatesOversizedChartCRD(t *testing.T) {
+	stubOversizedCRDDetect(t, oversizedCRDName, oversizedCRDDoc)
+	sch := newScheme(t)
+
+	hr := sampleHelmRelease("kube-prometheus-stack", "kube-prometheus-stack")
+	c := fake.NewClientBuilder().
+		WithScheme(sch).
+		WithObjects(hr, sampleHelmRepository(), sampleArgoNS(), sampleArgoServerService()).
+		WithStatusSubresource(&fluxhelmv2.HelmRelease{}, &argov1a1.Application{}).
+		Build()
+
+	r := &HelmReleaseReconciler{
+		Client:            c,
+		Scheme:            sch,
+		ArgoClient:        c,
+		Mode:              mode.InCluster,
+		DestinationServer: "https://kubernetes.default.svc",
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "kube-prometheus-stack", Namespace: testNS}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var crd apiextensionsv1.CustomResourceDefinition
+	if err := c.Get(context.Background(), types.NamespacedName{Name: oversizedCRDName}, &crd); err != nil {
+		t.Fatalf("oversized CRD not created: %v", err)
+	}
+	if crd.Spec.Group != "monitoring.coreos.com" {
+		t.Errorf("created CRD group = %q, want monitoring.coreos.com", crd.Spec.Group)
+	}
+
+	var app argov1a1.Application
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "kube-prometheus-stack", Namespace: "argocd"}, &app); err != nil {
+		t.Fatalf("application not created: %v", err)
+	}
+	for _, opt := range app.Spec.SyncPolicy.SyncOptions {
+		if opt == "ServerSideApply=true" {
+			t.Errorf("Application must keep client-side apply for FluxCD parity, got sync option %q", opt)
+		}
+	}
+	var ignored bool
+	for _, rule := range app.Spec.IgnoreDifferences {
+		if rule.Kind == "CustomResourceDefinition" && rule.Name == oversizedCRDName {
+			ignored = true
+		}
+	}
+	if !ignored {
+		t.Errorf("expected an ignoreDifferences rule for the oversized CRD, got %v", app.Spec.IgnoreDifferences)
+	}
+}
+
+// Verifies install-once: an existing CRD is never patched, even on a
+// different chart revision.
+func TestReconcile_LeavesExistingOversizedCRDAlone(t *testing.T) {
+	stubOversizedCRDDetect(t, oversizedCRDName, oversizedCRDDoc)
+	sch := newScheme(t)
+
+	existing := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   oversizedCRDName,
+			Labels: map[string]string{"pre": "existing"},
+		},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Group: "monitoring.coreos.com",
+			Scope: apiextensionsv1.NamespaceScoped,
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
+				Kind:     "Prometheus",
+				ListKind: "PrometheusList",
+				Plural:   "prometheuses",
+				Singular: "prom", // differs from the chart's copy
+			},
+		},
+	}
+
+	hr := sampleHelmRelease("kube-prometheus-stack", "kube-prometheus-stack")
+	c := fake.NewClientBuilder().
+		WithScheme(sch).
+		WithObjects(hr, sampleHelmRepository(), sampleArgoNS(), sampleArgoServerService(), existing).
+		WithStatusSubresource(&fluxhelmv2.HelmRelease{}, &argov1a1.Application{}).
+		Build()
+
+	r := &HelmReleaseReconciler{
+		Client:            c,
+		Scheme:            sch,
+		ArgoClient:        c,
+		Mode:              mode.InCluster,
+		DestinationServer: "https://kubernetes.default.svc",
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "kube-prometheus-stack", Namespace: testNS}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var crd apiextensionsv1.CustomResourceDefinition
+	if err := c.Get(context.Background(), types.NamespacedName{Name: oversizedCRDName}, &crd); err != nil {
+		t.Fatalf("pre-existing CRD gone: %v", err)
+	}
+	if crd.Labels["pre"] != "existing" || crd.Spec.Names.Singular != "prom" {
+		t.Errorf("pre-existing CRD was modified: labels=%v singular=%q", crd.Labels, crd.Spec.Names.Singular)
+	}
+}

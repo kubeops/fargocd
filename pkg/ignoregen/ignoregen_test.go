@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -574,29 +575,36 @@ data:
 // TestCaching verifies results are cached
 func TestCaching(t *testing.T) {
 	mu.Lock()
-	cache = make(map[cacheKey][]argov1a1.ResourceIgnoreDifferences)
+	cache = make(map[cacheKey]Result)
 	mu.Unlock()
 
 	// Manually populate cache
-	key := cacheKey{"test-chart", "v1.0.0", "ghcr.io/test", "default"}
+	key := cacheKey{"test-chart", "v1.0.0", "ghcr.io/test", "default", "test-release"}
 	mu.Lock()
-	cache[key] = []argov1a1.ResourceIgnoreDifferences{
-		{Kind: "Secret", Name: "cached-secret"},
+	cache[key] = Result{
+		Rules: []argov1a1.ResourceIgnoreDifferences{
+			{Kind: "Secret", Name: "cached-secret"},
+		},
+		HelmCRDs: []string{"widgets.example.com"},
 	}
 	mu.Unlock()
 
 	// DetectIgnoreDifferences should return cached result without rendering
-	rules, err := DetectIgnoreDifferences(context.Background(), "test-chart", "v1.0.0", "ghcr.io/test", "default", nil, nil)
+	res, err := DetectIgnoreDifferences(context.Background(), "test-chart", "v1.0.0", "ghcr.io/test", "default", "test-release", nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(rules) != 1 {
-		t.Fatalf("expected 1 rule, got %d", len(rules))
+	if len(res.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(res.Rules))
 	}
 
-	if rules[0].Name != "cached-secret" {
-		t.Errorf("expected cached-secret, got %s", rules[0].Name)
+	if res.Rules[0].Name != "cached-secret" {
+		t.Errorf("expected cached-secret, got %s", res.Rules[0].Name)
+	}
+
+	if len(res.HelmCRDs) != 1 || res.HelmCRDs[0] != "widgets.example.com" {
+		t.Errorf("expected cached HelmCRDs, got %v", res.HelmCRDs)
 	}
 }
 
@@ -628,5 +636,102 @@ spec:
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		findIgnoreDifferences(renders)
+	}
+}
+
+func TestZeroValuePointers(t *testing.T) {
+	spec := map[string]any{
+		"recommended":  false,            // false bool: dropped by omitempty round-trips
+		"enabled":      true,             // true bool survives round-trips
+		"requirements": map[string]any{}, // empty object: dropped by omitempty round-trips
+		"tags":         []any{},          // empty array: dropped by omitempty round-trips
+		"args":         []any{"x"},       // non-empty array survives
+		"title":        "",               // zero string has standalone k8s meaning; kept
+		"count":        float64(0),       // zero number has standalone k8s meaning; kept
+		"absent":       nil,              // explicit nulls belong to nullPointers
+		"nested": map[string]any{
+			"flag": false,
+			"name": "x",
+		},
+		"we/ird~key": false, // exercises RFC 6901 escaping
+	}
+
+	got := ZeroValuePointers("/spec", spec)
+	sort.Strings(got)
+	want := []string{
+		"/spec/nested/flag",
+		"/spec/recommended",
+		"/spec/requirements",
+		"/spec/tags",
+		"/spec/we~1ird~0key",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
+// Regression test: templated CRDs (e.g. keda's) used to be invisible to
+// helmCRDNames and skip oversized-CRD detection entirely.
+func TestDetectIgnoreDifferences_TemplatedCRDDetectedAsOversized(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
+
+	result, err := DetectIgnoreDifferences(context.Background(),
+		"keda", "2.19.0", "ghcr.io/appscode-charts", "keda", "keda", nil, nil)
+	if err != nil {
+		t.Fatalf("DetectIgnoreDifferences: %v", err)
+	}
+
+	found := false
+	for _, name := range result.OversizedHelmCRDs {
+		if name == "scaledjobs.keda.sh" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("scaledjobs.keda.sh not in OversizedHelmCRDs (got %v) - templated CRDs (chart's templates/crds/, not the conventional crds/ directory) must still be detected", result.OversizedHelmCRDs)
+	}
+	if _, ok := result.OversizedHelmCRDDocs["scaledjobs.keda.sh"]; !ok {
+		t.Error("OversizedHelmCRDDocs missing scaledjobs.keda.sh - ensureOversizedCRDs needs the raw doc to create it")
+	}
+}
+
+func TestHelmCRDNames_OversizedDocs(t *testing.T) {
+	small := `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: small.example.com
+spec:
+  group: example.com`
+	// Pad a second CRD past the client-side-apply size cutoff with a long
+	// description, the way real prometheus-operator CRDs blow the limit.
+	big := `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: big.example.com
+spec:
+  group: example.com
+  description: ` + strings.Repeat("x", oversizedCRDBytes)
+
+	names, oversized, docs := helmCRDNames(small + "\n---\n" + big)
+
+	wantNames := []string{"big.example.com", "small.example.com"}
+	if fmt.Sprint(names) != fmt.Sprint(wantNames) {
+		t.Fatalf("names = %v, want %v", names, wantNames)
+	}
+	if fmt.Sprint(oversized) != fmt.Sprint([]string{"big.example.com"}) {
+		t.Fatalf("oversized = %v, want [big.example.com]", oversized)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("oversizedDocs has %d entries, want 1: %v", len(docs), docs)
+	}
+	if doc := docs["big.example.com"]; !strings.HasPrefix(doc, "apiVersion:") || !strings.Contains(doc, "name: big.example.com") {
+		t.Fatalf("oversizedDocs[big.example.com] does not carry the raw manifest")
 	}
 }
