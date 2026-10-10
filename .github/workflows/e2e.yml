@@ -83,17 +83,17 @@ jobs:
         with:
           ref: refs/pull/${{ github.event.issue.number }}/merge
 
-      - name: Set up Go 1.25
+      - name: Set up Go 1.27
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           check-latest: true
 
       - name: Create Kubernetes ${{ matrix.k8s }} cluster
         id: kind
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
         with:
-          version: v0.31.0
+          version: v0.33.0
           node_image: kindest/node:${{ matrix.k8s }}
           cluster_name: fargocd-e2e
 
