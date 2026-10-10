@@ -1,8 +1,11 @@
 package helm
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -21,12 +24,13 @@ import (
 
 // A thin wrapper around the "helm" command, adding logging and error translation.
 type Cmd struct {
-	helmHome  string
-	WorkDir   string
-	IsLocal   bool
-	IsHelmOci bool
-	proxy     string
-	noProxy   string
+	helmHome        string
+	WorkDir         string
+	IsLocal         bool
+	IsHelmOci       bool
+	proxy           string
+	noProxy         string
+	runWithRedactor func(cmd *exec.Cmd, redactor func(text string) string) (string, error)
 }
 
 func NewCmd(workDir string, version string, proxy string, noProxy string) (*Cmd, error) {
@@ -39,21 +43,30 @@ func NewCmd(workDir string, version string, proxy string, noProxy string) (*Cmd,
 }
 
 func NewCmdWithVersion(workDir string, isHelmOci bool, proxy string, noProxy string) (*Cmd, error) {
+	return newCmdWithVersion(workDir, isHelmOci, proxy, noProxy, executil.RunWithRedactor)
+}
+
+func newCmdWithVersion(workDir string, isHelmOci bool, proxy string, noProxy string, runWithRedactor func(cmd *exec.Cmd, redactor func(text string) string) (string, error)) (*Cmd, error) {
 	tmpDir, err := os.MkdirTemp("", "helm")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temporary directory for helm: %w", err)
 	}
-	return &Cmd{WorkDir: workDir, helmHome: tmpDir, IsHelmOci: isHelmOci, proxy: proxy, noProxy: noProxy}, err
+	return &Cmd{WorkDir: workDir, helmHome: tmpDir, IsHelmOci: isHelmOci, proxy: proxy, noProxy: noProxy, runWithRedactor: runWithRedactor}, err
 }
 
 var redactor = func(text string) string {
 	return regexp.MustCompile("(--username|--password) [^ ]*").ReplaceAllString(text, "$1 ******")
 }
 
-func (c Cmd) run(args ...string) (string, string, error) {
-	cmd := exec.Command("helm", args...)
+func (c Cmd) run(ctx context.Context, args ...string) (string, string, error) {
+	return c.runWithStdin(ctx, nil, args...)
+}
+
+func (c Cmd) runWithStdin(ctx context.Context, stdin io.Reader, args ...string) (string, string, error) {
+	cmd := exec.CommandContext(ctx, "helm", args...)
 	cmd.Dir = c.WorkDir
 	cmd.Env = os.Environ()
+	cmd.Stdin = stdin
 	if !c.IsLocal {
 		cmd.Env = append(cmd.Env,
 			fmt.Sprintf("XDG_CACHE_HOME=%s/cache", c.helmHome),
@@ -62,13 +75,9 @@ func (c Cmd) run(args ...string) (string, string, error) {
 			fmt.Sprintf("HELM_CONFIG_HOME=%s/config", c.helmHome))
 	}
 
-	if c.IsHelmOci {
-		cmd.Env = append(cmd.Env, "HELM_EXPERIMENTAL_OCI=1")
-	}
-
 	cmd.Env = proxy.UpsertEnv(cmd, c.proxy, c.noProxy)
 
-	out, err := executil.RunWithRedactor(cmd, redactor)
+	out, err := c.runWithRedactor(cmd, redactor)
 	fullCommand := executil.GetCommandArgsToLog(cmd)
 	if err != nil {
 		return out, fullCommand, fmt.Errorf("failed to get command args to log: %w", err)
@@ -78,7 +87,11 @@ func (c Cmd) run(args ...string) (string, string, error) {
 
 func (c *Cmd) RegistryLogin(repo string, creds Creds) (string, error) {
 	args := []string{"registry", "login"}
-	args = append(args, repo)
+	registry, err := c.getHelmRegistry(repo)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse registry URL: %w", err)
+	}
+	args = append(args, registry)
 
 	if creds.GetUsername() != "" {
 		args = append(args, "--username", creds.GetUsername())
@@ -89,7 +102,7 @@ func (c *Cmd) RegistryLogin(repo string, creds Creds) (string, error) {
 		return "", fmt.Errorf("failed to get password for helm registry: %w", err)
 	}
 	if helmPassword != "" {
-		args = append(args, "--password", helmPassword)
+		args = append(args, "--password-stdin")
 	}
 
 	if creds.GetCAPath() != "" {
@@ -117,7 +130,11 @@ func (c *Cmd) RegistryLogin(repo string, creds Creds) (string, error) {
 	if creds.GetInsecureSkipVerify() {
 		args = append(args, "--insecure")
 	}
-	out, _, err := c.run(args...)
+	var stdin io.Reader
+	if helmPassword != "" {
+		stdin = strings.NewReader(helmPassword)
+	}
+	out, _, err := c.runWithStdin(context.Background(), stdin, args...)
 	if err != nil {
 		return "", fmt.Errorf("failed to login to registry: %w", err)
 	}
@@ -126,8 +143,12 @@ func (c *Cmd) RegistryLogin(repo string, creds Creds) (string, error) {
 
 func (c *Cmd) RegistryLogout(repo string, _ Creds) (string, error) {
 	args := []string{"registry", "logout"}
-	args = append(args, repo)
-	out, _, err := c.run(args...)
+	registry, err := c.getHelmRegistry(repo)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse registry URL: %w", err)
+	}
+	args = append(args, registry)
+	out, _, err := c.run(context.Background(), args...)
 	if err != nil {
 		return "", fmt.Errorf("failed to logout from registry: %w", err)
 	}
@@ -195,7 +216,7 @@ func (c *Cmd) RepoAdd(name string, url string, opts Creds, passCredentials bool)
 
 	args = append(args, name, url)
 
-	out, _, err := c.run(args...)
+	out, _, err := c.run(context.Background(), args...)
 	if err != nil {
 		return "", fmt.Errorf("failed to add repository: %w", err)
 	}
@@ -270,7 +291,7 @@ func (c *Cmd) Fetch(repo, chartName, version, destination string, creds Creds, p
 		args = append(args, "--pass-credentials")
 	}
 
-	out, _, err := c.run(args...)
+	out, _, err := c.run(context.Background(), args...)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch chart: %w", err)
 	}
@@ -309,15 +330,19 @@ func (c *Cmd) PullOCI(repo string, chart string, version string, destination str
 	if creds.GetInsecureSkipVerify() {
 		args = append(args, "--insecure-skip-tls-verify")
 	}
-	out, _, err := c.run(args...)
+	out, _, err := c.run(context.Background(), args...)
 	if err != nil {
 		return "", fmt.Errorf("failed to pull OCI chart: %w", err)
 	}
 	return out, nil
 }
 
-func (c *Cmd) dependencyBuild() (string, error) {
-	out, _, err := c.run("dependency", "build")
+func (c *Cmd) dependencyBuild(insecure bool) (string, error) {
+	args := []string{"dependency", "build"}
+	if insecure {
+		args = append(args, "--insecure-skip-tls-verify")
+	}
+	out, _, err := c.run(context.Background(), args...)
 	if err != nil {
 		return "", fmt.Errorf("failed to build dependencies: %w", err)
 	}
@@ -325,7 +350,7 @@ func (c *Cmd) dependencyBuild() (string, error) {
 }
 
 func (c *Cmd) inspectValues(values string) (string, error) {
-	out, _, err := c.run("show", "values", values)
+	out, _, err := c.run(context.Background(), "show", "values", values)
 	if err != nil {
 		return "", fmt.Errorf("failed to inspect values: %w", err)
 	}
@@ -333,7 +358,7 @@ func (c *Cmd) inspectValues(values string) (string, error) {
 }
 
 func (c *Cmd) InspectChart() (string, error) {
-	out, _, err := c.run("show", "chart", ".")
+	out, _, err := c.run(context.Background(), "show", "chart", ".")
 	if err != nil {
 		return "", fmt.Errorf("failed to inspect chart: %w", err)
 	}
@@ -430,7 +455,7 @@ func (c *Cmd) template(chartPath string, opts *TemplateOpts) (string, string, er
 		args = append(args, "--skip-tests")
 	}
 
-	out, command, err := c.run(args...)
+	out, command, err := c.run(context.Background(), args...)
 	if err != nil {
 		msg := err.Error()
 		if strings.Contains(msg, "--api-versions") {
@@ -462,7 +487,7 @@ func cleanupChartLockFile(chartPath string) (func(), error) {
 }
 
 func (c *Cmd) Freestyle(args ...string) (string, error) {
-	out, _, err := c.run(args...)
+	out, _, err := c.run(context.Background(), args...)
 	if err != nil {
 		return "", fmt.Errorf("failed to execute freestyle helm command: %w", err)
 	}
@@ -471,4 +496,19 @@ func (c *Cmd) Freestyle(args ...string) (string, error) {
 
 func (c *Cmd) Close() {
 	_ = os.RemoveAll(c.helmHome)
+}
+
+// getHelmRegistry extracts the registry host from a Helm repository URL. This is because it is required for the
+// `helm registry login` command to use the registry host rather than the full URL.
+func (c *Cmd) getHelmRegistry(repo string) (string, error) {
+	if !strings.Contains(repo, "//") {
+		repo = "//" + repo
+	}
+
+	uri, err := url.Parse(repo)
+	if err != nil {
+		return "", err
+	}
+
+	return uri.Host, nil
 }
