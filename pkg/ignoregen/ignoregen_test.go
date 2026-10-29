@@ -27,6 +27,7 @@ import (
 
 	argov1a1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/cli"
@@ -733,5 +734,85 @@ spec:
 	}
 	if doc := docs["big.example.com"]; !strings.HasPrefix(doc, "apiVersion:") || !strings.Contains(doc, "name: big.example.com") {
 		t.Fatalf("oversizedDocs[big.example.com] does not carry the raw manifest")
+	}
+}
+
+func TestLookupGuardedTemplates(t *testing.T) {
+	sub := &chart.Chart{
+		Metadata:  &chart.Metadata{Name: "sub"},
+		Templates: []*chart.File{{Name: "templates/cm.yaml", Data: []byte(`{{- if not (lookup "v1" "ConfigMap" "ns" "x") }}`)}},
+	}
+	parent := &chart.Chart{
+		Metadata: &chart.Metadata{Name: "ace"},
+		Templates: []*chart.File{
+			{Name: "templates/system-config.yaml", Data: []byte(`{{- if not (lookup "v1" "Secret" $ns $name) }}`)},
+			{Name: "templates/plain.yaml", Data: []byte(`{{ include "lookupHelper" . }}`)},
+		},
+	}
+	parent.AddDependency(sub)
+
+	got := lookupGuardedTemplates(parent)
+	want := map[string]bool{
+		"ace/templates/system-config.yaml": true,
+		"ace/charts/sub/templates/cm.yaml": true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for k := range want {
+		if !got[k] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
+func TestLookupGuardedRules(t *testing.T) {
+	manifest := `---
+# Source: ace/templates/system-config.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ace-system-config
+  namespace: ace
+stringData:
+  system.ini: x
+---
+# Source: ace/templates/plain-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: plain
+  namespace: ace
+---
+# Source: ace/charts/sub/templates/cm.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sub-cm
+  namespace: ace
+---
+# Source: ace/templates/gateway.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ace
+  namespace: ace
+`
+	lookups := map[string]bool{
+		"ace/templates/system-config.yaml": true,
+		"ace/charts/sub/templates/cm.yaml": true,
+		"ace/templates/gateway.yaml":       true,
+	}
+
+	got := map[string][]string{}
+	for _, r := range lookupGuardedRules(manifest, lookups) {
+		got[r.Kind+"/"+r.Name] = r.JSONPointers
+	}
+	want := map[string][]string{
+		"Secret/ace-system-config": {"/data", "/stringData"},
+		"ConfigMap/sub-cm":         {"/binaryData", "/data"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
 	}
 }

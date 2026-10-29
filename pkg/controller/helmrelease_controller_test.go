@@ -729,10 +729,17 @@ func TestReconcile_CreatesOversizedChartCRD(t *testing.T) {
 	if err := c.Get(context.Background(), types.NamespacedName{Name: "kube-prometheus-stack", Namespace: "argocd"}, &app); err != nil {
 		t.Fatalf("application not created: %v", err)
 	}
+	var respectIgnore bool
 	for _, opt := range app.Spec.SyncPolicy.SyncOptions {
 		if opt == "ServerSideApply=true" {
 			t.Errorf("Application must keep client-side apply for FluxCD parity, got sync option %q", opt)
 		}
+		if opt == "RespectIgnoreDifferences=true" {
+			respectIgnore = true
+		}
+	}
+	if !respectIgnore {
+		t.Errorf("expected RespectIgnoreDifferences=true, got %v", app.Spec.SyncPolicy.SyncOptions)
 	}
 	var ignored bool
 	for _, rule := range app.Spec.IgnoreDifferences {

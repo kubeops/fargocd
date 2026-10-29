@@ -24,8 +24,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -35,6 +37,7 @@ import (
 
 	argov1a1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/cli"
@@ -125,19 +128,22 @@ func detectIgnoreDifferences(ctx context.Context, chartName, chartVersion, repoU
 	// Render chart twice
 	var manifests []string
 	var crdManifest string
+	var lookupTemplates map[string]bool
 	for i := 0; i < 2; i++ {
-		m, crds, err := renderChart(ctx, chartName, chartVersion, repoURL, namespace, releaseName, values, creds)
+		m, crds, lookups, err := renderChart(ctx, chartName, chartVersion, repoURL, namespace, releaseName, values, creds)
 		if err != nil {
 			return Result{}, fmt.Errorf("render %d: %w", i+1, err)
 		}
 		manifests = append(manifests, m)
 		crdManifest = crds
+		lookupTemplates = lookups
 	}
 
 	// Find differences
 	rules := findIgnoreDifferences(manifests)
 	rules = append(rules, detectForeignChartResources(manifests[0], chartName, chartVersion, releaseName)...)
 	rules = append(rules, nullFieldRules(manifests[0])...)
+	rules = append(rules, lookupGuardedRules(manifests[0], lookupTemplates)...)
 
 	helmCRDs, oversizedCRDs, oversizedDocs := helmCRDNames(crdManifest)
 	res := Result{
@@ -249,6 +255,62 @@ func nullFieldRules(manifest string) []argov1a1.ResourceIgnoreDifferences {
 	return rules
 }
 
+var (
+	lookupCall   = regexp.MustCompile(`\blookup\s`)
+	sourceHeader = regexp.MustCompile(`(?m)^# Source: (.+)$`)
+)
+
+// lookupGuardedTemplates returns the "# Source:" paths of templates (subcharts
+// included) that call lookup.
+func lookupGuardedTemplates(c *chart.Chart) map[string]bool {
+	paths := make(map[string]bool)
+	for _, t := range c.Templates {
+		if lookupCall.Match(t.Data) {
+			paths[path.Join(c.ChartFullPath(), t.Name)] = true
+		}
+	}
+	for _, dep := range c.Dependencies() {
+		maps.Copy(paths, lookupGuardedTemplates(dep))
+	}
+	return paths
+}
+
+// lookupGuardedRules ignores the payload of Secrets/ConfigMaps rendered from a
+// lookup-calling template. Offline renders never see the live object, so a
+// create-once guard always renders the seed value and Argo CD would revert
+// whatever was written at runtime; both renders agree, so findIgnoreDifferences misses it.
+func lookupGuardedRules(manifest string, lookupTemplates map[string]bool) []argov1a1.ResourceIgnoreDifferences {
+	if len(lookupTemplates) == 0 {
+		return nil
+	}
+	var rules []argov1a1.ResourceIgnoreDifferences
+	for _, doc := range yamlDocSeparator.Split(manifest, -1) {
+		m := sourceHeader.FindStringSubmatch(doc)
+		if m == nil || !lookupTemplates[strings.TrimSpace(m[1])] {
+			continue
+		}
+		for _, res := range parseResources(doc) {
+			var ptrs []string
+			switch res.Kind {
+			case "Secret":
+				ptrs = []string{"/data", "/stringData"}
+			case "ConfigMap":
+				ptrs = []string{"/binaryData", "/data"}
+			default:
+				continue
+			}
+			rules = append(rules, argov1a1.ResourceIgnoreDifferences{
+				Group:        res.Group,
+				Kind:         res.Kind,
+				Name:         res.Name,
+				Namespace:    res.Namespace,
+				JSONPointers: ptrs,
+			})
+		}
+	}
+	return rules
+}
+
 // nullPointers returns a JSON pointer per null-valued field. Arrays aren't
 // descended into -- a null element's index-based pointer is too fragile.
 func nullPointers(prefix string, m map[string]any) []string {
@@ -355,7 +417,7 @@ func unionStrings(a, b []string) []string {
 	return out
 }
 
-func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespace, releaseName string, values map[string]any, creds *RegistryCredentials) (manifest, crdManifest string, err error) {
+func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespace, releaseName string, values map[string]any, creds *RegistryCredentials) (manifest, crdManifest string, lookupTemplates map[string]bool, err error) {
 	settings := cli.New()
 
 	// Build registry client options
@@ -374,7 +436,7 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 		if len(creds.CACert) > 0 || (len(creds.ClientCert) > 0 && len(creds.ClientKey) > 0) {
 			httpClient, err := buildTLSClient(creds)
 			if err != nil {
-				return "", "", fmt.Errorf("build TLS client: %w", err)
+				return "", "", nil, fmt.Errorf("build TLS client: %w", err)
 			}
 			regOpts = append(regOpts, registry.ClientOptHTTPClient(httpClient))
 		}
@@ -382,7 +444,7 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 
 	regClient, err := registry.NewClient(regOpts...)
 	if err != nil {
-		return "", "", fmt.Errorf("registry client: %w", err)
+		return "", "", nil, fmt.Errorf("registry client: %w", err)
 	}
 
 	actionConfig := new(action.Configuration)
@@ -399,14 +461,14 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 
 	tmpDir, err := os.MkdirTemp("", "helm-pull-*")
 	if err != nil {
-		return "", "", fmt.Errorf("temp dir: %w", err)
+		return "", "", nil, fmt.Errorf("temp dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 	pullClient.DestDir = tmpDir
 
 	chartRef := fmt.Sprintf("oci://%s/%s", repoURL, chartName)
 	if _, err := pullClient.Run(chartRef); err != nil {
-		return "", "", fmt.Errorf("pull %s:%s: %w", chartRef, chartVersion, err)
+		return "", "", nil, fmt.Errorf("pull %s:%s: %w", chartRef, chartVersion, err)
 	}
 
 	// Load chart
@@ -419,12 +481,12 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 		}
 	}
 	if chartPath == "" {
-		return "", "", fmt.Errorf("no chart found in %s", tmpDir)
+		return "", "", nil, fmt.Errorf("no chart found in %s", tmpDir)
 	}
 
 	chrt, err := loader.Load(chartPath)
 	if err != nil {
-		return "", "", fmt.Errorf("load chart: %w", err)
+		return "", "", nil, fmt.Errorf("load chart: %w", err)
 	}
 
 	// Render
@@ -447,7 +509,7 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 
 	rel, err := installClient.RunWithContext(ctx, chrt, values)
 	if err != nil {
-		return "", "", fmt.Errorf("render: %w", err)
+		return "", "", nil, fmt.Errorf("render: %w", err)
 	}
 
 	// Also collect CRDs some charts (e.g. keda) author as regular templates,
@@ -476,7 +538,7 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 		}
 	}
 
-	return rel.Manifest, strings.Join(crdDocs, "\n---\n"), nil
+	return rel.Manifest, strings.Join(crdDocs, "\n---\n"), lookupGuardedTemplates(chrt), nil
 }
 
 // Resource represents a parsed Kubernetes resource
