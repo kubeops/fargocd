@@ -177,8 +177,16 @@ SDK (we explicitly avoid shelling out to the `helm` CLI):
      values change → `/spec/template/metadata/annotations/<key>`
    - `CustomResourceDefinition.spec` differences → `/spec`, plus
      annotation diffs → `/metadata/annotations/<key>`
-5. Memoise the result by `(chart, version, repoURL, namespace)` so the
+5. Secrets/ConfigMaps rendered from a template that calls `lookup` →
+   `/data`, `/stringData` (`/binaryData` for ConfigMaps). Such templates
+   are create-once guards (`if not (lookup ...)`): offline renders never see
+   the live object, so both renders emit the same seed value and step 4
+   can't catch it, yet Argo CD would revert whatever was written at runtime.
+6. Memoise the result by `(chart, version, repoURL, namespace)` so the
    second reconcile is free.
+
+Applications set `RespectIgnoreDifferences=true` so these rules also hold
+when a resource is applied for some other drift (e.g. a chart label bump).
 
 The package exposes `DetectFn` so unit tests can stub the helm pipeline
 without needing network access.

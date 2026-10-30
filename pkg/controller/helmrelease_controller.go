@@ -608,6 +608,9 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 				// Needed for the ignoreDifferences rules above to actually
 				// stop a shared/oversized CRD from being re-applied every sync.
 				"ApplyOutOfSyncOnly=true",
+				// Without it, a resource OutOfSync on any other field is applied
+				// whole, clobbering the ignored ones (e.g. runtime-written Secret data).
+				"RespectIgnoreDifferences=true",
 				// No ServerSideApply: it hard-fails on chart output Helm's
 				// client-side apply quietly tolerates (e.g. explicit nulls).
 			},
