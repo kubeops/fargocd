@@ -72,7 +72,22 @@ const (
 	// Argo CD namespace on the principal/local cluster.
 	argoServerLabelKey   = "app.kubernetes.io/name"
 	argoServerLabelValue = "argocd-server"
+
+	compareOptionsAnnotation = "argocd.argoproj.io/compare-options"
+	serverSideDiffOption     = "ServerSideDiff"
 )
+
+func withServerSideDiff(opts string) string {
+	for _, o := range strings.Split(opts, ",") {
+		if strings.HasPrefix(strings.TrimSpace(o), serverSideDiffOption+"=") {
+			return opts
+		}
+	}
+	if strings.TrimSpace(opts) == "" {
+		return serverSideDiffOption + "=true"
+	}
+	return opts + "," + serverSideDiffOption + "=true"
+}
 
 // HelmReleaseReconciler watches FluxCD HelmRelease objects and projects each
 // of them into an Argo CD Application on the cluster reached by ArgoClient.
@@ -534,6 +549,7 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 		return err
 	}
 	app.Annotations[HelmReleaseAnnotation] = hrRef
+	app.Annotations[compareOptionsAnnotation] = withServerSideDiff(app.Annotations[compareOptionsAnnotation])
 
 	// Argo CD's own cascade-delete finalizer, so deleting this Application
 	// prunes its deployed resources instead of abandoning them.
