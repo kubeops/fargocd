@@ -673,12 +673,12 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 		if r.helmCRDs.owner(crd) == hrKey && !oversized[crd] {
 			continue
 		}
-		rules = append(rules, argov1a1.ResourceIgnoreDifferences{
-			Group:        "apiextensions.k8s.io",
-			Kind:         "CustomResourceDefinition",
-			Name:         crd,
-			JSONPointers: []string{"/spec", "/metadata/labels", "/metadata/annotations"},
-		})
+		rules = append(rules, crdBackOffRule(crd))
+	}
+	// A local-config copy defers to whichever release really ships the CRD;
+	// Argo CD still creates it when missing, matching Helm's crds/ semantics.
+	for _, crd := range detected.LocalConfigHelmCRDs {
+		rules = append(rules, crdBackOffRule(crd))
 	}
 
 	// Fields the CRD schema doesn't declare get pruned by the API server
@@ -691,9 +691,27 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 
 	// Break the fight Argo CD reports via Shared/RepeatedResourceWarning by
 	// ignoring the mutable parts of the contested resource; self-clears once the warning stops.
-	app.Spec.IgnoreDifferences = append(rules, sharedResourceIgnoreRules(app.Status)...)
+	for _, rule := range sharedResourceIgnoreRules(app.Status) {
+		// A chart that also vendors a local-config copy of its own CRD makes
+		// Argo CD report it repeated; the elected owner must keep upgrading it.
+		if rule.Group == "apiextensions.k8s.io" && rule.Kind == "CustomResourceDefinition" &&
+			r.helmCRDs.owner(rule.Name) == hrKey && !oversized[rule.Name] {
+			continue
+		}
+		rules = append(rules, rule)
+	}
+	app.Spec.IgnoreDifferences = rules
 
 	return nil
+}
+
+func crdBackOffRule(crd string) argov1a1.ResourceIgnoreDifferences {
+	return argov1a1.ResourceIgnoreDifferences{
+		Group:        "apiextensions.k8s.io",
+		Kind:         "CustomResourceDefinition",
+		Name:         crd,
+		JSONPointers: []string{"/spec", "/metadata/labels", "/metadata/annotations"},
+	}
 }
 
 // ensureOversizedCRDs directly creates any missing chart CRD too large for
