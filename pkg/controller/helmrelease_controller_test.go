@@ -601,6 +601,76 @@ func TestStatusMirrorsApplicationConditions(t *testing.T) {
 	}
 }
 
+func TestStatusHandledOnlyAfterCurrentSpecSynced(t *testing.T) {
+	source := &argov1a1.ApplicationSource{RepoURL: "ghcr.io/appscode-charts", Chart: "kubedb", TargetRevision: "v1.0.0"}
+	stale := source.DeepCopy()
+	stale.TargetRevision = "v0.9.0"
+
+	cases := map[string]struct {
+		status      argov1a1.ApplicationStatus
+		wantHandled bool
+	}{
+		"synced current spec": {
+			status:      argov1a1.ApplicationStatus{Sync: argov1a1.SyncStatus{Status: argov1a1.SyncStatusCodeSynced, ComparedTo: argov1a1.ComparedTo{Source: *source}}},
+			wantHandled: true,
+		},
+		"synced previous spec": {
+			status: argov1a1.ApplicationStatus{Sync: argov1a1.SyncStatus{Status: argov1a1.SyncStatusCodeSynced, ComparedTo: argov1a1.ComparedTo{Source: *stale}}},
+		},
+		"out of sync after successful sync of current spec": {
+			status: argov1a1.ApplicationStatus{
+				Sync:           argov1a1.SyncStatus{Status: argov1a1.SyncStatusCodeOutOfSync, ComparedTo: argov1a1.ComparedTo{Source: *source}},
+				OperationState: &argov1a1.OperationState{Phase: "Succeeded", SyncResult: &argov1a1.SyncOperationResult{Source: *source}},
+			},
+			wantHandled: true,
+		},
+		"successful sync of previous spec": {
+			status: argov1a1.ApplicationStatus{
+				Sync:           argov1a1.SyncStatus{Status: argov1a1.SyncStatusCodeOutOfSync, ComparedTo: argov1a1.ComparedTo{Source: *source}},
+				OperationState: &argov1a1.OperationState{Phase: "Succeeded", SyncResult: &argov1a1.SyncOperationResult{Source: *stale}},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			sch := newScheme(t)
+			hr := sampleHelmRelease("kubedb", "kubedb")
+			hr.Generation = 3
+			hr.Annotations = map[string]string{
+				meta.ReconcileRequestAnnotation:   "req-1",
+				fluxhelmv2.ForceRequestAnnotation: "force-1",
+			}
+			c := fake.NewClientBuilder().
+				WithScheme(sch).
+				WithObjects(hr).
+				WithStatusSubresource(&fluxhelmv2.HelmRelease{}).
+				Build()
+			r := &HelmReleaseReconciler{Client: c, Scheme: sch, ArgoClient: c, Mode: mode.InCluster, ArgoNamespace: "argocd"}
+
+			app := &argov1a1.Application{
+				ObjectMeta: metav1.ObjectMeta{Name: "kubedb", Namespace: "argocd"},
+				Spec:       argov1a1.ApplicationSpec{Source: source.DeepCopy()},
+				Status:     tc.status,
+			}
+			if err := r.updateHelmReleaseStatus(context.Background(), hr, app); err != nil {
+				t.Fatalf("updateHelmReleaseStatus: %v", err)
+			}
+
+			var post fluxhelmv2.HelmRelease
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(hr), &post); err != nil {
+				t.Fatalf("get HR: %v", err)
+			}
+			handled := post.Status.ObservedGeneration == post.Generation &&
+				post.Status.LastHandledReconcileAt == "req-1" &&
+				post.Status.LastHandledForceAt == "force-1"
+			if handled != tc.wantHandled {
+				t.Errorf("handled = %v, want %v (status: %+v)", handled, tc.wantHandled, post.Status)
+			}
+		})
+	}
+}
+
 var _ = client.IgnoreNotFound
 
 // Verifies zero-valued CR spec fields get ignoreDifferences pointers, and
