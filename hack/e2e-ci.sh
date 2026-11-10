@@ -77,7 +77,7 @@ log "Starting fargocd in background (in-cluster mode)"
     --metrics-bind-address=0 \
     --health-probe-bind-address=0 \
     --argo-dest-server=https://kubernetes.default.svc \
-    --argo-project=default \
+    --argo-project=ace \
     >/tmp/fargocd.log 2>&1 &
 FARGOCD_PID=$!
 trap 'kill ${FARGOCD_PID} 2>/dev/null || true; echo "--- fargocd log tail ---"; tail -n 200 /tmp/fargocd.log || true' EXIT

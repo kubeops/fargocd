@@ -91,7 +91,7 @@ func NewCmdRun() *cobra.Command {
 		mode:          string(mode.InCluster),
 		// No default: the controller falls back when both dest fields are
 		// empty, and Helm's `with` can't clear a non-empty default.
-		project: "default",
+		project: "ace",
 	}
 
 	cmd := &cobra.Command{

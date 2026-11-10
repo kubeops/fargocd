@@ -137,7 +137,11 @@ type HelmReleaseReconciler struct {
 	// crdSchemas caches, per custom-resource GVK, which top-level spec
 	// fields the live CRD schema declares. The zero value is ready to use.
 	crdSchemas crdSchemaCache
+
+	ensuredProjects sync.Map
 }
+
+const defaultProject = "ace"
 
 // crdSchemaCache memoises CRD spec schemas fetched from the workload
 // cluster. Entries expire so a CRD upgrade is picked up without a restart.
@@ -368,6 +372,10 @@ func (r *HelmReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.reconcileDelete(ctx, &hr, argoNamespace)
 	}
 
+	if err := r.ensureAppProject(ctx, argoNamespace); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if !controllerutil.ContainsFinalizer(&hr, FinalizerName) {
 		controllerutil.AddFinalizer(&hr, FinalizerName)
 		if err := r.Update(ctx, &hr); err != nil {
@@ -471,6 +479,41 @@ func (r *HelmReleaseReconciler) deleteApplication(ctx context.Context, hr *fluxh
 // multi-cluster naming rule documented in the Design doc.
 func (r *HelmReleaseReconciler) appName(hr *fluxhelmv2.HelmRelease) string {
 	return applicationName(hr, r.ClusterName)
+}
+
+func (r *HelmReleaseReconciler) project() string {
+	if r.Project == "" {
+		return defaultProject
+	}
+	return r.Project
+}
+
+// ensureAppProject creates the Applications' project once per process when
+// missing; an existing project is left untouched so admins can tighten it.
+func (r *HelmReleaseReconciler) ensureAppProject(ctx context.Context, argoNamespace string) error {
+	name := r.project()
+	if name == "default" {
+		return nil
+	}
+	key := argoNamespace + "/" + name
+	if _, done := r.ensuredProjects.Load(key); done {
+		return nil
+	}
+	proj := &argov1a1.AppProject{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: argoNamespace},
+		Spec: argov1a1.AppProjectSpec{
+			SourceRepos: []string{"*"},
+			// Argo CD matches a destination on server or name; a second entry
+			// would collide with this one under its server/namespace dedup key.
+			Destinations:             []argov1a1.ApplicationDestination{{Server: "*", Name: "*", Namespace: "*"}},
+			ClusterResourceWhitelist: []metav1.GroupKind{{Group: "*", Kind: "*"}},
+		},
+	}
+	if err := r.ArgoClient.Create(ctx, proj); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create AppProject %s: %w", key, err)
+	}
+	r.ensuredProjects.Store(key, struct{}{})
+	return nil
 }
 
 // resolveArgoNamespace returns the explicitly configured namespace or, when
@@ -584,11 +627,6 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 		rawValues = ""
 	}
 
-	project := r.Project
-	if project == "" {
-		project = "default"
-	}
-
 	destination := argov1a1.ApplicationDestination{
 		Namespace: hr.GetReleaseNamespace(),
 		Server:    r.DestinationServer,
@@ -599,7 +637,7 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 	}
 
 	app.Spec = argov1a1.ApplicationSpec{
-		Project: project,
+		Project: r.project(),
 		Source: &argov1a1.ApplicationSource{
 			RepoURL:        strings.TrimPrefix(repoURL, "oci://"),
 			Chart:          hr.Spec.Chart.Spec.Chart,

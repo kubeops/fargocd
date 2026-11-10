@@ -97,7 +97,7 @@ fargocd will:
 | `--argo-namespace` | _auto_ | Override namespace auto-discovery. Required when `argocd-server` is not labelled `app.kubernetes.io/name=argocd-server`. |
 | `--argo-dest-server` | `https://kubernetes.default.svc` | `Application.spec.destination.server`. |
 | `--argo-dest-name` | _empty_ | `Application.spec.destination.name` (symbolic cluster name). |
-| `--argo-project` | `default` | Argo CD Project assigned to generated Applications. |
+| `--argo-project` | `ace` | Argo CD Project assigned to generated Applications. |
 | `--cluster-name` | _empty_ | Required in `managed` mode. Suffixes Application names so a single principal can serve many clusters without collisions. |
 | `--leader-elect` | `false` | Enable leader election. |
 | `--metrics-bind-address` | `0` | `:8443` for HTTPS metrics, `0` to disable. |

@@ -46,7 +46,7 @@ func NewManagerOptions() *ManagerOptions {
 		// Preserves pre-existing behavior across binary upgrades.
 		Mode: string(mode.InCluster),
 		// No default: see run.go's runOptions for why.
-		Project: "default",
+		Project: "ace",
 	}
 }
 
