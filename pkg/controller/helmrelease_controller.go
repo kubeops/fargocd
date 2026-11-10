@@ -706,11 +706,21 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 	// Argo CD can't even create oversized CRDs (client-side apply's own
 	// annotation exceeds the size cap); create any missing ones directly.
 	r.ensureOversizedCRDs(ctx, detected.OversizedHelmCRDDocs)
+	external := make(map[string]bool)
 	for _, crd := range detected.HelmCRDs {
 		// The elected owner keeps managing it, unless oversized -- then not
 		// even the owner can patch it, so it's install-once for everyone.
 		if r.helmCRDs.owner(crd) == hrKey && !oversized[crd] {
-			continue
+			// A CRD owned outside Helm (e.g. OpenShift's CVO) would revert
+			// every write, so even the elected owner backs off.
+			ext, err := r.externallyOwnedCRD(ctx, crd)
+			if err != nil {
+				return fmt.Errorf("check ownership of CRD %s: %w", crd, err)
+			}
+			if !ext {
+				continue
+			}
+			external[crd] = true
 		}
 		rules = append(rules, crdBackOffRule(crd))
 	}
@@ -734,7 +744,7 @@ func (r *HelmReleaseReconciler) syncApplication(ctx context.Context, app *argov1
 		// A chart that also vendors a local-config copy of its own CRD makes
 		// Argo CD report it repeated; the elected owner must keep upgrading it.
 		if rule.Group == "apiextensions.k8s.io" && rule.Kind == "CustomResourceDefinition" &&
-			r.helmCRDs.owner(rule.Name) == hrKey && !oversized[rule.Name] {
+			r.helmCRDs.owner(rule.Name) == hrKey && !oversized[rule.Name] && !external[rule.Name] {
 			continue
 		}
 		rules = append(rules, rule)
@@ -751,6 +761,22 @@ func crdBackOffRule(crd string) argov1a1.ResourceIgnoreDifferences {
 		Name:         crd,
 		JSONPointers: []string{"/spec", "/metadata/labels", "/metadata/annotations"},
 	}
+}
+
+func (r *HelmReleaseReconciler) externallyOwnedCRD(ctx context.Context, name string) (bool, error) {
+	crd := &unstructured.Unstructured{}
+	crd.SetGroupVersionKind(schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"})
+	if err := r.Get(ctx, types.NamespacedName{Name: name}, crd); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if len(crd.GetOwnerReferences()) > 0 {
+		return true, nil
+	}
+	managedBy, ok := crd.GetLabels()["app.kubernetes.io/managed-by"]
+	return ok && managedBy != "Helm", nil
 }
 
 // ensureOversizedCRDs directly creates any missing chart CRD too large for
