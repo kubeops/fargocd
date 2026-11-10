@@ -132,20 +132,21 @@ func detectIgnoreDifferences(ctx context.Context, chartName, chartVersion, repoU
 	// Render chart twice
 	var manifests []string
 	var crdManifest string
-	var lookupTemplates map[string]bool
+	var lookupTemplates, ownChartLabels map[string]bool
 	for i := 0; i < 2; i++ {
-		m, crds, lookups, err := renderChart(ctx, chartName, chartVersion, repoURL, namespace, releaseName, values, creds)
+		m, crds, lookups, labels, err := renderChart(ctx, chartName, chartVersion, repoURL, namespace, releaseName, values, creds)
 		if err != nil {
 			return Result{}, fmt.Errorf("render %d: %w", i+1, err)
 		}
 		manifests = append(manifests, m)
 		crdManifest = crds
 		lookupTemplates = lookups
+		ownChartLabels = labels
 	}
 
 	// Find differences
 	rules := findIgnoreDifferences(manifests)
-	rules = append(rules, detectForeignChartResources(manifests[0], chartName, chartVersion, releaseName)...)
+	rules = append(rules, detectForeignChartResources(manifests[0], ownChartLabels, releaseName)...)
 	rules = append(rules, nullFieldRules(manifests[0])...)
 	rules = append(rules, lookupGuardedRules(manifests[0], lookupTemplates)...)
 
@@ -170,9 +171,7 @@ func detectIgnoreDifferences(ctx context.Context, chartName, chartVersion, repoU
 
 // detectForeignChartResources finds resources whose helm.sh/chart or
 // app.kubernetes.io/instance labels don't match this release -- a vendored resource the double-render diff alone can't catch.
-func detectForeignChartResources(manifest, chartName, chartVersion, releaseName string) []argov1a1.ResourceIgnoreDifferences {
-	expectedChart := chartName + "-" + chartVersion
-
+func detectForeignChartResources(manifest string, ownChartLabels map[string]bool, releaseName string) []argov1a1.ResourceIgnoreDifferences {
 	var rules []argov1a1.ResourceIgnoreDifferences
 	for _, res := range parseResources(manifest) {
 		labels, _ := res.Metadata["labels"].(map[string]any)
@@ -183,7 +182,7 @@ func detectForeignChartResources(manifest, chartName, chartVersion, releaseName 
 		chartLabel, _ := labels["helm.sh/chart"].(string)
 		instanceLabel, _ := labels["app.kubernetes.io/instance"].(string)
 
-		chartMismatch := chartLabel != "" && chartLabel != expectedChart
+		chartMismatch := chartLabel != "" && !ownChartLabels[chartLabel]
 		instanceMismatch := instanceLabel != "" && releaseName != "" && instanceLabel != releaseName
 		if !chartMismatch && !instanceMismatch {
 			continue
@@ -464,7 +463,7 @@ func unionStrings(a, b []string) []string {
 	return out
 }
 
-func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespace, releaseName string, values map[string]any, creds *RegistryCredentials) (manifest, crdManifest string, lookupTemplates map[string]bool, err error) {
+func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespace, releaseName string, values map[string]any, creds *RegistryCredentials) (manifest, crdManifest string, lookupTemplates, ownChartLabels map[string]bool, err error) {
 	settings := cli.New()
 
 	// Build registry client options
@@ -483,7 +482,7 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 		if len(creds.CACert) > 0 || (len(creds.ClientCert) > 0 && len(creds.ClientKey) > 0) {
 			httpClient, err := buildTLSClient(creds)
 			if err != nil {
-				return "", "", nil, fmt.Errorf("build TLS client: %w", err)
+				return "", "", nil, nil, fmt.Errorf("build TLS client: %w", err)
 			}
 			regOpts = append(regOpts, registry.ClientOptHTTPClient(httpClient))
 		}
@@ -491,7 +490,7 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 
 	regClient, err := registry.NewClient(regOpts...)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("registry client: %w", err)
+		return "", "", nil, nil, fmt.Errorf("registry client: %w", err)
 	}
 
 	actionConfig := new(action.Configuration)
@@ -508,14 +507,14 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 
 	tmpDir, err := os.MkdirTemp("", "helm-pull-*")
 	if err != nil {
-		return "", "", nil, fmt.Errorf("temp dir: %w", err)
+		return "", "", nil, nil, fmt.Errorf("temp dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 	pullClient.DestDir = tmpDir
 
 	chartRef := fmt.Sprintf("oci://%s/%s", repoURL, chartName)
 	if _, err := pullClient.Run(chartRef); err != nil {
-		return "", "", nil, fmt.Errorf("pull %s:%s: %w", chartRef, chartVersion, err)
+		return "", "", nil, nil, fmt.Errorf("pull %s:%s: %w", chartRef, chartVersion, err)
 	}
 
 	// Load chart
@@ -528,12 +527,12 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 		}
 	}
 	if chartPath == "" {
-		return "", "", nil, fmt.Errorf("no chart found in %s", tmpDir)
+		return "", "", nil, nil, fmt.Errorf("no chart found in %s", tmpDir)
 	}
 
 	chrt, err := loader.Load(chartPath)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("load chart: %w", err)
+		return "", "", nil, nil, fmt.Errorf("load chart: %w", err)
 	}
 
 	// Render
@@ -556,7 +555,7 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 
 	rel, err := installClient.RunWithContext(ctx, chrt, values)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("render: %w", err)
+		return "", "", nil, nil, fmt.Errorf("render: %w", err)
 	}
 
 	// Also collect CRDs some charts (e.g. keda) author as regular templates,
@@ -585,7 +584,18 @@ func renderChart(ctx context.Context, chartName, chartVersion, repoURL, namespac
 		}
 	}
 
-	return rel.Manifest, strings.Join(crdDocs, "\n---\n"), lookupGuardedTemplates(chrt), nil
+	return rel.Manifest, strings.Join(crdDocs, "\n---\n"), lookupGuardedTemplates(chrt), chartLabels(chrt), nil
+}
+
+// chartLabels returns the helm.sh/chart values the chart and its subcharts
+// stamp on their own objects, in both raw and Helm's conventional +→_ form.
+func chartLabels(c *chart.Chart) map[string]bool {
+	label := c.Name() + "-" + c.Metadata.Version
+	s := map[string]bool{label: true, strings.ReplaceAll(label, "+", "_"): true}
+	for _, d := range c.Dependencies() {
+		maps.Copy(s, chartLabels(d))
+	}
+	return s
 }
 
 // Resource represents a parsed Kubernetes resource
