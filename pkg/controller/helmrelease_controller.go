@@ -31,6 +31,7 @@ import (
 	argov1a1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/gitops-engine/pkg/health"
 	fluxhelmv2 "github.com/fluxcd/helm-controller/api/v2"
+	fluxmeta "github.com/fluxcd/pkg/apis/meta"
 	"github.com/fluxcd/pkg/chartutil"
 	fluxsrcv1 "github.com/fluxcd/source-controller/api/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -1004,7 +1005,26 @@ func (r *HelmReleaseReconciler) updateHelmReleaseStatus(ctx context.Context, hr 
 	if app.Status.Sync.Status == argov1a1.SyncStatusCodeSynced {
 		hr.Status.LastAttemptedRevision = app.Status.Sync.Revision
 	}
+	// stamping these before Argo CD acts on the current spec lets a stale Ready pass
+	if appSyncedCurrentSpec(app) {
+		hr.Status.ObservedGeneration = hr.Generation
+		annotations := hr.GetAnnotations()
+		hr.Status.LastHandledReconcileAt = annotations[fluxmeta.ReconcileRequestAnnotation]
+		hr.Status.LastHandledForceAt = annotations[fluxhelmv2.ForceRequestAnnotation]
+	}
 	return r.Status().Patch(ctx, hr, patch)
+}
+
+// OutOfSync after a successful sync is normal without selfHeal.
+func appSyncedCurrentSpec(app *argov1a1.Application) bool {
+	if app.Spec.Source == nil {
+		return false
+	}
+	if app.Status.Sync.Status == argov1a1.SyncStatusCodeSynced && app.Spec.Source.Equals(&app.Status.Sync.ComparedTo.Source) {
+		return true
+	}
+	op := app.Status.OperationState
+	return op != nil && op.Phase.Successful() && op.SyncResult != nil && app.Spec.Source.Equals(&op.SyncResult.Source)
 }
 
 // SetupWithManager wires watches for HelmRelease, HelmRepository, the Argo
