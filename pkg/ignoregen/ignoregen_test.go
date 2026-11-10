@@ -816,3 +816,30 @@ metadata:
 		t.Fatalf("got %v, want %v", got, want)
 	}
 }
+
+func TestSplitLocalConfigCRDs(t *testing.T) {
+	crd := func(name string, local bool) string {
+		doc := "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: " + name + "\n"
+		if local {
+			doc += "  annotations:\n    config.kubernetes.io/local-config: \"true\"\n"
+		}
+		return doc
+	}
+	manifest := strings.Join([]string{
+		crd("owned.example.com", false),
+		crd("mixed.example.com", true),
+		crd("mixed.example.com", false),
+		crd("local.example.com", true),
+		crd("local.example.com", true),
+	}, "---\n")
+
+	names, _, _ := helmCRDNames(manifest)
+	owned, local := splitLocalConfigCRDs(names, localConfigOnlyCRDs(manifest))
+
+	if want := []string{"mixed.example.com", "owned.example.com"}; fmt.Sprint(owned) != fmt.Sprint(want) {
+		t.Errorf("owned = %v, want %v", owned, want)
+	}
+	if want := []string{"local.example.com"}; fmt.Sprint(local) != fmt.Sprint(want) {
+		t.Errorf("localConfig = %v, want %v", local, want)
+	}
+}

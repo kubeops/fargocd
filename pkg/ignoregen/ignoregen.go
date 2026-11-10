@@ -79,6 +79,10 @@ type Result struct {
 	// HelmCRDs lists the names of CustomResourceDefinitions shipped in the
 	// chart's crds/ directory (including subcharts').
 	HelmCRDs []string
+	// LocalConfigHelmCRDs lists crds/ CRDs whose every copy in the chart is
+	// annotated config.kubernetes.io/local-config=true: reference copies
+	// (e.g. a catalog chart's) of a CRD another chart owns. Disjoint from HelmCRDs.
+	LocalConfigHelmCRDs []string
 	// OversizedHelmCRDs is the subset of HelmCRDs too large for client-side
 	// apply to ever patch (exceeds the 256KiB last-applied-config annotation cap).
 	OversizedHelmCRDs []string
@@ -146,9 +150,11 @@ func detectIgnoreDifferences(ctx context.Context, chartName, chartVersion, repoU
 	rules = append(rules, lookupGuardedRules(manifests[0], lookupTemplates)...)
 
 	helmCRDs, oversizedCRDs, oversizedDocs := helmCRDNames(crdManifest)
+	helmCRDs, localConfigCRDs := splitLocalConfigCRDs(helmCRDs, localConfigOnlyCRDs(crdManifest))
 	res := Result{
 		Rules:                dedupeRules(rules),
 		HelmCRDs:             helmCRDs,
+		LocalConfigHelmCRDs:  localConfigCRDs,
 		OversizedHelmCRDs:    oversizedCRDs,
 		OversizedHelmCRDDocs: oversizedDocs,
 		Objects:              renderedObjects(manifests[0]),
@@ -228,6 +234,47 @@ func helmCRDNames(crdManifest string) (names, oversized []string, oversizedDocs 
 	sort.Strings(names)
 	sort.Strings(oversized)
 	return names, oversized, oversizedDocs
+}
+
+const localConfigAnnotation = "config.kubernetes.io/local-config"
+
+// localConfigOnlyCRDs returns the CRDs in crdManifest whose every copy carries
+// the local-config annotation. Argo CD doesn't honor that kustomize/kpt
+// convention, so fargocd has to.
+func localConfigOnlyCRDs(crdManifest string) map[string]bool {
+	localOnly := make(map[string]bool)
+	for _, doc := range yamlDocSeparator.Split(crdManifest, -1) {
+		for _, r := range parseResources(doc) {
+			if r.Kind != "CustomResourceDefinition" {
+				continue
+			}
+			annotations, _ := r.Metadata["annotations"].(map[string]any)
+			isLocal := annotations[localConfigAnnotation] == "true"
+			if seen, ok := localOnly[r.Name]; ok {
+				isLocal = isLocal && seen
+			}
+			localOnly[r.Name] = isLocal
+		}
+	}
+	return localOnly
+}
+
+// splitLocalConfigCRDs dedupes names and partitions them into owned CRDs and
+// local-config-only ones.
+func splitLocalConfigCRDs(names []string, localOnly map[string]bool) (owned, localConfig []string) {
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		if localOnly[name] {
+			localConfig = append(localConfig, name)
+		} else {
+			owned = append(owned, name)
+		}
+	}
+	return owned, localConfig
 }
 
 // nullFieldRules ignores explicit-null fields: they never survive a write

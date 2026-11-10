@@ -803,3 +803,64 @@ func TestReconcile_LeavesExistingOversizedCRDAlone(t *testing.T) {
 		t.Errorf("pre-existing CRD was modified: labels=%v singular=%q", crd.Labels, crd.Spec.Names.Singular)
 	}
 }
+
+const addonsCRD = "addons.addons.kubestash.com"
+
+func hasCRDRule(app *argov1a1.Application, crd string) bool {
+	for _, rule := range app.Spec.IgnoreDifferences {
+		if rule.Kind == "CustomResourceDefinition" && rule.Name == crd {
+			return true
+		}
+	}
+	return false
+}
+
+// A release carrying only a local-config copy ("kubedb" sorts first) must not
+// win the CRD election, and the owner must keep managing its CRD even when
+// Argo CD reports it repeated within the owner's own Application.
+func TestReconcile_LocalConfigCRDNeverOwns(t *testing.T) {
+	orig := ignoregen.DetectFn
+	ignoregen.DetectFn = func(_ context.Context, chart string, _ string, _ string, _ string, _ string, _ map[string]any, _ *ignoregen.RegistryCredentials) (ignoregen.Result, error) {
+		if chart == "kubedb" {
+			return ignoregen.Result{LocalConfigHelmCRDs: []string{addonsCRD}}, nil
+		}
+		return ignoregen.Result{HelmCRDs: []string{addonsCRD}}, nil
+	}
+	t.Cleanup(func() { ignoregen.DetectFn = orig })
+
+	sch := newScheme(t)
+	ownerApp := &argov1a1.Application{
+		ObjectMeta: metav1.ObjectMeta{Name: "kubestash", Namespace: "argocd"},
+		Status: argov1a1.ApplicationStatus{Conditions: []argov1a1.ApplicationCondition{{
+			Type:    argov1a1.ApplicationConditionRepeatedResourceWarning,
+			Message: "Resource apiextensions.k8s.io/CustomResourceDefinition//" + addonsCRD + " appeared 2 times among application resources.",
+		}}},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(sch).
+		WithObjects(sampleHelmRelease("kubedb", "kubedb"), sampleHelmRelease("kubestash", "kubestash"),
+			sampleHelmRepository(), sampleArgoNS(), sampleArgoServerService(), ownerApp).
+		WithStatusSubresource(&fluxhelmv2.HelmRelease{}, &argov1a1.Application{}).
+		Build()
+	r := &HelmReleaseReconciler{Client: c, Scheme: sch, ArgoClient: c, Mode: mode.InCluster, DestinationServer: "https://kubernetes.default.svc"}
+
+	for _, name := range []string{"kubedb", "kubestash"} {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: testNS}}); err != nil {
+			t.Fatalf("reconcile %s: %v", name, err)
+		}
+	}
+
+	var kubedb, kubestash argov1a1.Application
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "kubedb", Namespace: "argocd"}, &kubedb); err != nil {
+		t.Fatalf("get kubedb app: %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "kubestash", Namespace: "argocd"}, &kubestash); err != nil {
+		t.Fatalf("get kubestash app: %v", err)
+	}
+	if !hasCRDRule(&kubedb, addonsCRD) {
+		t.Errorf("local-config release must back off from %s, got %v", addonsCRD, kubedb.Spec.IgnoreDifferences)
+	}
+	if hasCRDRule(&kubestash, addonsCRD) {
+		t.Errorf("owner must keep managing %s, got %v", addonsCRD, kubestash.Spec.IgnoreDifferences)
+	}
+}
