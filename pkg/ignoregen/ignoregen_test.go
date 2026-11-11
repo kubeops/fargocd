@@ -649,7 +649,7 @@ func TestZeroValuePointers(t *testing.T) {
 		"args":         []any{"x"},       // non-empty array survives
 		"title":        "",               // zero string has standalone k8s meaning; kept
 		"count":        float64(0),       // zero number has standalone k8s meaning; kept
-		"absent":       nil,              // explicit nulls belong to nullPointers
+		"absent":       nil,              // explicit nulls belong to nullFieldRules
 		"nested": map[string]any{
 			"flag": false,
 			"name": "x",

@@ -282,20 +282,15 @@ func nullFieldRules(manifest string) []argov1a1.ResourceIgnoreDifferences {
 	var rules []argov1a1.ResourceIgnoreDifferences
 	for _, res := range parseResources(manifest) {
 		spec, ok := res.Spec.(map[string]any)
-		if !ok {
+		if !ok || !containsNull(spec) {
 			continue
 		}
-		ptrs := nullPointers("/spec", spec)
-		if len(ptrs) == 0 {
-			continue
-		}
-		sort.Strings(ptrs)
 		rules = append(rules, argov1a1.ResourceIgnoreDifferences{
-			Group:        res.Group,
-			Kind:         res.Kind,
-			Name:         res.Name,
-			Namespace:    res.Namespace,
-			JSONPointers: ptrs,
+			Group:             res.Group,
+			Kind:              res.Kind,
+			Name:              res.Name,
+			Namespace:         res.Namespace,
+			JQPathExpressions: []string{nullSpecFieldsExpr},
 		})
 	}
 	return rules
@@ -357,20 +352,28 @@ func lookupGuardedRules(manifest string, lookupTemplates map[string]bool) []argo
 	return rules
 }
 
-// nullPointers returns a JSON pointer per null-valued field. Arrays aren't
-// descended into -- a null element's index-based pointer is too fragile.
-func nullPointers(prefix string, m map[string]any) []string {
-	var ptrs []string
-	for k, v := range m {
-		p := prefix + "/" + escapeJSONPointer(k)
-		switch vv := v.(type) {
-		case nil:
-			ptrs = append(ptrs, p)
-		case map[string]any:
-			ptrs = append(ptrs, nullPointers(p, vv)...)
+// nullSpecFieldsExpr also reaches nulls inside arrays, which index-based JSON
+// pointers can't track stably. Argo CD evaluates it as del(<expr>).
+const nullSpecFieldsExpr = ".spec | .. | select(. == null)"
+
+func containsNull(v any) bool {
+	switch vv := v.(type) {
+	case nil:
+		return true
+	case map[string]any:
+		for _, e := range vv {
+			if containsNull(e) {
+				return true
+			}
+		}
+	case []any:
+		for _, e := range vv {
+			if containsNull(e) {
+				return true
+			}
 		}
 	}
-	return ptrs
+	return false
 }
 
 // escapeJSONPointer escapes a map key for use in an RFC 6901 JSON pointer.
