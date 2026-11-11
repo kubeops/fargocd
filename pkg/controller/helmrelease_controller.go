@@ -264,16 +264,14 @@ func (r *HelmReleaseReconciler) zeroValueSpecFieldRules(ctx context.Context, obj
 			continue
 		}
 		ptrs := ignoregen.ZeroValuePointers("/spec", obj.Spec)
-		if len(ptrs) == 0 {
-			continue
-		}
 		sort.Strings(ptrs)
 		rules = append(rules, argov1a1.ResourceIgnoreDifferences{
-			Group:        obj.Group,
-			Kind:         obj.Kind,
-			Name:         obj.Name,
-			Namespace:    obj.Namespace,
-			JSONPointers: ptrs,
+			Group:             obj.Group,
+			Kind:              obj.Kind,
+			Name:              obj.Name,
+			Namespace:         obj.Namespace,
+			JSONPointers:      ptrs,
+			JQPathExpressions: []string{ignoregen.EmptySpecObjectsExpr},
 		})
 	}
 	return rules

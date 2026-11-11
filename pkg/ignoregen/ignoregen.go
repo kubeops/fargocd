@@ -356,6 +356,11 @@ func lookupGuardedRules(manifest string, lookupTemplates map[string]bool) []argo
 // pointers can't track stably. Argo CD evaluates it as del(<expr>).
 const nullSpecFieldsExpr = ".spec | .. | select(. == null)"
 
+// EmptySpecObjectsExpr covers empty objects a CR's admission webhook or typed
+// round-trip adds or drops at any depth, including inside arrays, so they never
+// show up in the rendered manifest.
+const EmptySpecObjectsExpr = ".spec | .. | select(. == {})"
+
 func containsNull(v any) bool {
 	switch vv := v.(type) {
 	case nil:
