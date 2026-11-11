@@ -123,11 +123,10 @@ namespace, so a namespaced `Role` is enough:
 | --- | --- | --- |
 | `argoproj.io` | `applications` | `get`, `list`, `watch`, `create`, `patch`, `delete` |
 | `argoproj.io` | `appprojects` | `create` |
-| `""` | `services` | `get`, `list`, `watch` |
 
-Without `--argo-namespace`, fargocd finds the `argocd-server` Service
-across all namespaces, so the same rules must be granted with a
-`ClusterRole`.
+Without `--argo-namespace`, fargocd discovers the namespace by watching the
+`argocd-server` Service across all namespaces, so grant the rules above
+plus `get`, `list`, `watch` on `services` with a `ClusterRole`.
 
 ## Build, lint, test
 
