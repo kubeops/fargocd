@@ -1,12 +1,12 @@
 // Copyright 2025 The casbin Authors. All Rights Reserved.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Apache License, Version 2.0 (the "License").
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
 //      http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software
+// Unless required by applicable law or agreed to in writing, software.
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
@@ -18,22 +18,31 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/casbin/casbin/v2/model"
 	"github.com/casbin/casbin/v2/persist"
 )
 
+const (
+	// Default timeout duration for lock acquisition.
+	defaultLockTimeout = 30 * time.Second
+)
+
 // Transaction represents a Casbin transaction.
-// It provides methods to perform policy operations within a transaction
+// It provides methods to perform policy operations within a transaction.
 // and commit or rollback all changes atomically.
 type Transaction struct {
-	enforcer   *TransactionalEnforcer     // Reference to the transactional enforcer
-	buffer     *TransactionBuffer         // Buffer for policy operations
-	txContext  persist.TransactionContext // Database transaction context
-	ctx        context.Context            // Context for the transaction
-	committed  bool                       // Whether the transaction has been committed
-	rolledBack bool                       // Whether the transaction has been rolled back
-	mutex      sync.RWMutex               // Protects transaction state
+	id          string                     // Unique transaction identifier.
+	enforcer    *TransactionalEnforcer     // Reference to the transactional enforcer.
+	buffer      *TransactionBuffer         // Buffer for policy operations.
+	txContext   persist.TransactionContext // Database transaction context.
+	ctx         context.Context            // Context for the transaction.
+	baseVersion int64                      // Model version at transaction start.
+	committed   bool                       // Whether the transaction has been committed.
+	rolledBack  bool                       // Whether the transaction has been rolled back.
+	startTime   time.Time                  // Transaction start timestamp.
+	mutex       sync.RWMutex               // Protects transaction state.
 }
 
 // AddPolicy adds a policy within the transaction.
@@ -42,26 +51,42 @@ func (tx *Transaction) AddPolicy(params ...interface{}) (bool, error) {
 	return tx.AddNamedPolicy("p", params...)
 }
 
+// buildRuleFromParams converts parameters to a rule slice.
+func (tx *Transaction) buildRuleFromParams(params ...interface{}) []string {
+	if len(params) == 1 {
+		if strSlice, ok := params[0].([]string); ok {
+			rule := make([]string, 0, len(strSlice))
+			rule = append(rule, strSlice...)
+			return rule
+		}
+	}
+
+	rule := make([]string, 0, len(params))
+	for _, param := range params {
+		rule = append(rule, param.(string))
+	}
+	return rule
+}
+
+// checkTransactionStatus checks if the transaction is active.
+func (tx *Transaction) checkTransactionStatus() error {
+	if tx.committed || tx.rolledBack {
+		return errors.New("transaction is not active")
+	}
+	return nil
+}
+
 // AddNamedPolicy adds a named policy within the transaction.
 // The policy is buffered and will be applied when the transaction is committed.
 func (tx *Transaction) AddNamedPolicy(ptype string, params ...interface{}) (bool, error) {
 	tx.mutex.Lock()
 	defer tx.mutex.Unlock()
 
-	if tx.committed || tx.rolledBack {
-		return false, errors.New("transaction is not active")
+	if err := tx.checkTransactionStatus(); err != nil {
+		return false, err
 	}
 
-	var rule []string
-	if strSlice, ok := params[0].([]string); len(params) == 1 && ok {
-		rule = make([]string, len(strSlice))
-		copy(rule, strSlice)
-	} else {
-		rule = make([]string, 0, len(params))
-		for _, param := range params {
-			rule = append(rule, param.(string))
-		}
-	}
+	rule := tx.buildRuleFromParams(params...)
 
 	// Check if policy already exists in the buffered model.
 	bufferedModel, err := tx.buffer.ApplyOperationsToModel(tx.buffer.GetModelSnapshot())
@@ -96,8 +121,8 @@ func (tx *Transaction) AddNamedPolicies(ptype string, rules [][]string) (bool, e
 	tx.mutex.Lock()
 	defer tx.mutex.Unlock()
 
-	if tx.committed || tx.rolledBack {
-		return false, errors.New("transaction is not active")
+	if err := tx.checkTransactionStatus(); err != nil {
+		return false, err
 	}
 
 	if len(rules) == 0 {
@@ -147,20 +172,11 @@ func (tx *Transaction) RemoveNamedPolicy(ptype string, params ...interface{}) (b
 	tx.mutex.Lock()
 	defer tx.mutex.Unlock()
 
-	if tx.committed || tx.rolledBack {
-		return false, errors.New("transaction is not active")
+	if err := tx.checkTransactionStatus(); err != nil {
+		return false, err
 	}
 
-	var rule []string
-	if strSlice, ok := params[0].([]string); len(params) == 1 && ok {
-		rule = make([]string, len(strSlice))
-		copy(rule, strSlice)
-	} else {
-		rule = make([]string, 0, len(params))
-		for _, param := range params {
-			rule = append(rule, param.(string))
-		}
-	}
+	rule := tx.buildRuleFromParams(params...)
 
 	// Check if policy exists in the buffered model.
 	bufferedModel, err := tx.buffer.ApplyOperationsToModel(tx.buffer.GetModelSnapshot())
@@ -195,8 +211,8 @@ func (tx *Transaction) RemoveNamedPolicies(ptype string, rules [][]string) (bool
 	tx.mutex.Lock()
 	defer tx.mutex.Unlock()
 
-	if tx.committed || tx.rolledBack {
-		return false, errors.New("transaction is not active")
+	if err := tx.checkTransactionStatus(); err != nil {
+		return false, err
 	}
 
 	if len(rules) == 0 {
@@ -246,8 +262,8 @@ func (tx *Transaction) UpdateNamedPolicy(ptype string, oldPolicy []string, newPo
 	tx.mutex.Lock()
 	defer tx.mutex.Unlock()
 
-	if tx.committed || tx.rolledBack {
-		return false, errors.New("transaction is not active")
+	if err := tx.checkTransactionStatus(); err != nil {
+		return false, err
 	}
 
 	// Check if old policy exists and new policy doesn't exist.
@@ -257,13 +273,19 @@ func (tx *Transaction) UpdateNamedPolicy(ptype string, oldPolicy []string, newPo
 	}
 
 	hasOldPolicy, err := bufferedModel.HasPolicy("p", ptype, oldPolicy)
-	if !hasOldPolicy || err != nil {
+	if err != nil {
 		return false, err
 	}
+	if !hasOldPolicy {
+		return false, nil
+	}
 
-	hasNewPolicy, err := bufferedModel.HasPolicy("p", ptype, newPolicy)
-	if hasNewPolicy || err != nil {
-		return false, err
+	hasNewPolicy, errNew := bufferedModel.HasPolicy("p", ptype, newPolicy)
+	if errNew != nil {
+		return false, errNew
+	}
+	if hasNewPolicy {
+		return false, nil
 	}
 
 	// Add operation to buffer.
@@ -289,20 +311,11 @@ func (tx *Transaction) AddNamedGroupingPolicy(ptype string, params ...interface{
 	tx.mutex.Lock()
 	defer tx.mutex.Unlock()
 
-	if tx.committed || tx.rolledBack {
-		return false, errors.New("transaction is not active")
+	if err := tx.checkTransactionStatus(); err != nil {
+		return false, err
 	}
 
-	var rule []string
-	if strSlice, ok := params[0].([]string); len(params) == 1 && ok {
-		rule = make([]string, len(strSlice))
-		copy(rule, strSlice)
-	} else {
-		rule = make([]string, 0, len(params))
-		for _, param := range params {
-			rule = append(rule, param.(string))
-		}
-	}
+	rule := tx.buildRuleFromParams(params...)
 
 	// Check if grouping policy already exists in the buffered model.
 	bufferedModel, err := tx.buffer.ApplyOperationsToModel(tx.buffer.GetModelSnapshot())
@@ -337,20 +350,11 @@ func (tx *Transaction) RemoveNamedGroupingPolicy(ptype string, params ...interfa
 	tx.mutex.Lock()
 	defer tx.mutex.Unlock()
 
-	if tx.committed || tx.rolledBack {
-		return false, errors.New("transaction is not active")
+	if err := tx.checkTransactionStatus(); err != nil {
+		return false, err
 	}
 
-	var rule []string
-	if strSlice, ok := params[0].([]string); len(params) == 1 && ok {
-		rule = make([]string, len(strSlice))
-		copy(rule, strSlice)
-	} else {
-		rule = make([]string, 0, len(params))
-		for _, param := range params {
-			rule = append(rule, param.(string))
-		}
-	}
+	rule := tx.buildRuleFromParams(params...)
 
 	// Check if grouping policy exists in the buffered model.
 	bufferedModel, err := tx.buffer.ApplyOperationsToModel(tx.buffer.GetModelSnapshot())
@@ -381,8 +385,8 @@ func (tx *Transaction) GetBufferedModel() (model.Model, error) {
 	tx.mutex.RLock()
 	defer tx.mutex.RUnlock()
 
-	if tx.committed || tx.rolledBack {
-		return nil, errors.New("transaction is not active")
+	if err := tx.checkTransactionStatus(); err != nil {
+		return nil, err
 	}
 
 	return tx.buffer.ApplyOperationsToModel(tx.buffer.GetModelSnapshot())
@@ -400,4 +404,32 @@ func (tx *Transaction) OperationCount() int {
 	tx.mutex.RLock()
 	defer tx.mutex.RUnlock()
 	return tx.buffer.OperationCount()
+}
+
+// tryLockWithTimeout attempts to acquire the lock within the specified timeout period.
+func tryLockWithTimeout(lock *sync.Mutex, startTime time.Time, maxWait time.Duration) bool {
+	// Calculate remaining wait time based on transaction start time.
+	remainingTime := maxWait - time.Since(startTime)
+	if remainingTime <= 0 {
+		return false
+	}
+
+	// Create a context with timeout for lock acquisition.
+	ctx, cancel := context.WithTimeout(context.Background(), remainingTime)
+	defer cancel()
+
+	// Use channel for timeout control.
+	done := make(chan bool, 1)
+	go func() {
+		lock.Lock()
+		done <- true
+	}()
+
+	// Wait for either lock acquisition or timeout.
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
