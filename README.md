@@ -113,6 +113,21 @@ generated Application name is `<HelmRelease.name>-<cluster-name>` so two
 clusters can have a `kubedb` release without colliding. The ACE umbrella
 chart is exempt because only one ACE release exists per principal.
 
+### Principal RBAC (managed mode)
+
+The identity in `--argo-kubeconfig` needs these permissions on the
+principal. With `--argo-namespace` set, fargocd only watches that
+namespace, so a namespaced `Role` is enough:
+
+| API group | Resource | Verbs |
+| --- | --- | --- |
+| `argoproj.io` | `applications` | `get`, `list`, `watch`, `create`, `patch`, `delete` |
+| `argoproj.io` | `appprojects` | `create` |
+
+Without `--argo-namespace`, fargocd discovers the namespace by watching the
+`argocd-server` Service across all namespaces, so grant the rules above
+plus `get`, `list`, `watch` on `services` with a `ClusterRole`.
+
 ## Build, lint, test
 
 All Make targets run inside `ghcr.io/appscode/golang-dev`; Docker must be

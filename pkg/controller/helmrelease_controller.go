@@ -1093,7 +1093,7 @@ func appSyncedCurrentSpec(app *argov1a1.Application) bool {
 // CD Application that mirrors each HelmRelease, and the argocd-server
 // Service used for namespace auto-discovery.
 func (r *HelmReleaseReconciler) SetupWithManager(mgr, argoMgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&fluxhelmv2.HelmRelease{}).
 		// Re-reconcile when the mirrored Application changes (status, etc).
 		WatchesRawSource(source.Kind[client.Object](
@@ -1142,10 +1142,11 @@ func (r *HelmReleaseReconciler) SetupWithManager(mgr, argoMgr ctrl.Manager) erro
 				}
 				return reqs
 			}),
-		).
-		// The argocd-server Service is observed so we can rediscover the
-		// Argo CD namespace if it moves.
-		WatchesRawSource(source.Kind[client.Object](
+		)
+	// The argocd-server Service is observed so we can rediscover the Argo CD
+	// namespace if it moves; a pinned namespace makes discovery moot.
+	if r.ArgoNamespace == "" {
+		bldr = bldr.WatchesRawSource(source.Kind[client.Object](
 			argoMgr.GetCache(),
 			&corev1.Service{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []ctrl.Request {
@@ -1166,6 +1167,7 @@ func (r *HelmReleaseReconciler) SetupWithManager(mgr, argoMgr ctrl.Manager) erro
 				return reqs
 			}),
 			predicate.LabelChangedPredicate{},
-		)).
-		Complete(r)
+		))
+	}
+	return bldr.Complete(r)
 }

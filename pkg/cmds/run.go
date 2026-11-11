@@ -44,6 +44,7 @@ import (
 	"k8s.io/klog/v2"
 	uiapi "kmodules.xyz/resource-metadata/apis/ui/v1alpha1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -317,13 +318,19 @@ func buildArgoManager(opts runOptions, mgr ctrl.Manager) (ctrl.Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build Argo CD rest config: %w", err)
 	}
-	argoMgr, err := ctrl.NewManager(argoConfig, ctrl.Options{
+	argoOpts := ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: "0"},
 		HealthProbeBindAddress: "0",
 		LeaderElection:         opts.enableLeaderElection,
 		LeaderElectionID:       "03b9a432.fargocd.appscode.com",
-	})
+	}
+	// Scoping the cache lets the principal grant a namespaced Role instead
+	// of cluster-wide list/watch on Applications and Services.
+	if opts.argoNamespace != "" {
+		argoOpts.Cache = cache.Options{DefaultNamespaces: map[string]cache.Config{opts.argoNamespace: {}}}
+	}
+	argoMgr, err := ctrl.NewManager(argoConfig, argoOpts)
 	if err != nil {
 		return nil, fmt.Errorf("create Argo CD manager: %w", err)
 	}
