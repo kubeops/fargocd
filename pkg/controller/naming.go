@@ -46,15 +46,9 @@ func applicationName(hr *fluxhelmv2.HelmRelease, clusterName string) string {
 	return fmt.Sprintf("%s-%s", hr.Name, clusterName)
 }
 
-// isACE reports whether the HelmRelease points at the ACE umbrella chart.
-// Both the HelmRelease's name and the chart name are checked because users
-// sometimes rename the resource but keep the chart identifier intact.
+// isACE matches on the chart only: a HelmRelease merely named "ace" (e.g.
+// ace-gw/ace for service-gateway) must still get the cluster suffix, or it
+// collides with the real ACE Application.
 func isACE(hr *fluxhelmv2.HelmRelease) bool {
-	if hr.Name == aceChartName {
-		return true
-	}
-	if hr.Spec.Chart != nil && hr.Spec.Chart.Spec.Chart == aceChartName {
-		return true
-	}
-	return false
+	return hr.Spec.Chart != nil && hr.Spec.Chart.Spec.Chart == aceChartName
 }
