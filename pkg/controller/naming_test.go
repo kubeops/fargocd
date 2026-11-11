@@ -36,6 +36,7 @@ func TestApplicationName(t *testing.T) {
 		{"ace HR name is exempt", "ace", "ace", "prod", "ace"},
 		{"ace chart name is exempt even with different HR name", "ace-prod", "ace", "prod", "ace-prod"},
 		{"no suffix without cluster, ace too", "ace", "ace", "", "ace"},
+		{"HR named ace with non-ace chart gets suffix", "ace", "service-gateway", "aro-spoke", "ace-aro-spoke"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

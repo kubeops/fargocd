@@ -145,9 +145,11 @@ The Argo CD Application name is `<HelmRelease.name>-<cluster-name>` when
 `--cluster-name` is set, with one exception: the ACE umbrella chart keeps
 its un-suffixed `ace` name because only one ACE release exists per
 principal. This rule is implemented in `pkg/controller/naming.go` and is
-covered by `naming_test.go`. The exception triggers on either the
-HelmRelease name being `ace` _or_ the chart name being `ace`, so renaming
-the resource for organisational reasons does not break the convention.
+covered by `naming_test.go`. The exception triggers only on the chart name
+being `ace`, so renaming the resource does not break the convention, and an
+unrelated release that happens to be named `ace` (e.g. `ace-gw/ace` for the
+`service-gateway` chart) still gets the suffix instead of colliding with the
+real ACE Application.
 
 ## Auto-generated `ignoreDifferences`
 
